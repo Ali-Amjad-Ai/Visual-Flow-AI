@@ -53,10 +53,7 @@ export default function Sidebar({ activeView, setActiveView, activeProjectName, 
   const percentUsed = Math.min(100, (totalMB / 10240) * 100); // Out of 10 GB (10240 MB)
   const menuItems = [
     { id: 'dashboard', name: 'Dashboard', icon: LayoutDashboard, disabled: false },
-    { id: 'workspace', name: 'Workspace', icon: FileVideo, disabled: !activeProjectName },
-    { id: 'media-library', name: 'Media Library', icon: Database, disabled: false },
-    { id: 'settings', name: 'Studio Settings', icon: Settings, disabled: false },
-    { id: 'help', name: 'Documentation', icon: HelpCircle, disabled: false }
+    { id: 'workspace', name: 'Workspace', icon: FileVideo, disabled: !activeProjectName }
   ] as const;
 
   return (

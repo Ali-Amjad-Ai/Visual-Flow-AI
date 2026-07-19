@@ -101,6 +101,11 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const imageUploaderRef = useRef<HTMLInputElement>(null);
 
+  // Find currently active timeline clip and active section based on current playhead time
+  const activeClip = project.clips.find(clip => currentTime >= clip.start && currentTime < clip.end);
+  const activeMedia = activeClip ? project.mediaItems.find(m => m.id === activeClip.mediaId) : null;
+  const activeSection = project.sections.find(sec => currentTime >= sec.start && currentTime < sec.end);
+
   // Scroll to chat bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -131,10 +136,42 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     };
   }, [isPlaying, playbackSpeed, project.duration]);
 
-  // Find currently active timeline clip and active section based on current playhead time
-  const activeClip = project.clips.find(clip => currentTime >= clip.start && currentTime < clip.end);
-  const activeMedia = activeClip ? project.mediaItems.find(m => m.id === activeClip.mediaId) : null;
-  const activeSection = project.sections.find(sec => currentTime >= sec.start && currentTime < sec.end);
+  // Voice Synthesis Narrator (Web Speech API)
+  const lastSpokenSectionIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    // If paused, or muted, or no active section, cancel speech
+    if (!isPlaying || isMuted || !activeSection) {
+      window.speechSynthesis.cancel();
+      lastSpokenSectionIdRef.current = null;
+      return;
+    }
+
+    // Speak when we transition into a new section
+    if (activeSection && activeSection.id !== lastSpokenSectionIdRef.current) {
+      lastSpokenSectionIdRef.current = activeSection.id;
+      window.speechSynthesis.cancel(); // cancel any active speech
+
+      const utterance = new SpeechSynthesisUtterance(activeSection.transcript);
+      utterance.rate = playbackSpeed; // Sync speaking speed with playback speed
+      
+      // Select an English voice if possible
+      const voices = window.speechSynthesis.getVoices();
+      const voice = voices.find(v => v.lang.startsWith('en')) || null;
+      if (voice) {
+        utterance.voice = voice;
+      }
+
+      window.speechSynthesis.speak(utterance);
+    }
+  }, [isPlaying, activeSection, isMuted, playbackSpeed]);
+
+  // Clean up speech on unmount
+  useEffect(() => {
+    return () => {
+      window.speechSynthesis.cancel();
+    };
+  }, []);
 
   // Scroll timeline to active clip automatically if offscreen
   const timelineRulerRef = useRef<HTMLDivElement>(null);
@@ -242,6 +279,17 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         });
       }, 200);
     }
+  };
+
+  const handleClearDemoImages = () => {
+    // Keep only user uploaded images and audio
+    const userOnlyMedia = project.mediaItems.filter(m => m.id.startsWith('user_img_') || m.type === 'audio');
+    onUpdateProject({
+      ...project,
+      mediaItems: userOnlyMedia,
+      clips: [] // clear the clips as they refer to the cleared images
+    });
+    appendAiMessage(`🧹 **Demo Preset Assets Cleared**\n\nAll preset template images have been successfully removed from your catalog. You can now add your own images using the **Add Images** button and click **Sync With AI** to map them to your timeline!`);
   };
 
   // Core intelligence workflow: Continue Synchronization
@@ -573,127 +621,63 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         // Generate or map clips
         let finalClips: TimelineClip[] = [];
         const duration = project.duration;
-        const segmentLen = Math.floor(duration / 5);
 
-        // Check if there are some images to map
-        const usedMedia = project.mediaItems.filter(m => m.type === 'image');
+        // Prioritize user uploaded images over default template ones
+        const userUploadedMedia = project.mediaItems.filter(m => m.type === 'image' && (m.id.startsWith('user_img_') || !m.name.startsWith('visual_asset')));
+        const mockMedia = project.mediaItems.filter(m => m.type === 'image' && !m.id.startsWith('user_img_') && m.name.startsWith('visual_asset'));
+        
+        // If user has uploaded images, use them exclusively! Otherwise fallback to mock templates.
+        const sortedMedia = userUploadedMedia.length > 0 ? userUploadedMedia : mockMedia;
+        
+        // Dynamically build clips to fit all sorted images up to a reasonable count (max 12)
+        const count = Math.max(1, Math.min(sortedMedia.length, 12));
+        const clipDuration = duration / count;
+        
+        finalClips = Array.from({ length: count }).map((_, idx) => {
+          const start = idx * clipDuration;
+          const end = Math.min(start + clipDuration, duration);
+          const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
+          const effect = effects[idx % effects.length];
+          const isStrictFlagged = project.highPrecisionSync && (idx % 3 === 1);
+
+          return {
+            id: `clip_${project.highPrecisionSync ? 'strict' : 'std'}_${idx}_${Date.now()}`,
+            mediaId: sortedMedia[idx]?.id || 'p1_img1',
+            start: parseFloat(start.toFixed(1)),
+            end: parseFloat(end.toFixed(1)),
+            locked: false,
+            confidence: isStrictFlagged ? 65 : 100,
+            panZoomEffect: effect as any
+          };
+        });
+
+        // Update all media statuses based on whether they were selected in finalClips
+        const usedMediaIds = finalClips.map(c => c.mediaId);
+        const updatedMediaItems = project.mediaItems.map(item => ({
+          ...item,
+          status: usedMediaIds.includes(item.id) ? ('used' as const) : ('unused' as const)
+        }));
         
         if (project.highPrecisionSync) {
-          // Strict engine: some clips don't have perfect matches (confidence < 100)
-          finalClips = [
-            {
-              id: `clip_strict_1_${Date.now()}`,
-              mediaId: usedMedia[0]?.id || 'p1_img1',
-              start: 0,
-              end: segmentLen,
-              locked: false,
-              confidence: 100,
-              panZoomEffect: 'zoom-in'
-            },
-            {
-              id: `clip_strict_2_${Date.now()}`,
-              mediaId: usedMedia[1]?.id || 'p1_img2',
-              start: segmentLen,
-              end: segmentLen * 2,
-              locked: false,
-              confidence: 68, // FLAGGED: Non-perfect confidence match!
-              panZoomEffect: 'pan-left'
-            },
-            {
-              id: `clip_strict_3_${Date.now()}`,
-              mediaId: usedMedia[2]?.id || 'p1_img3',
-              start: segmentLen * 2,
-              end: segmentLen * 3,
-              locked: false,
-              confidence: 100,
-              panZoomEffect: 'none'
-            },
-            {
-              id: `clip_strict_4_${Date.now()}`,
-              mediaId: usedMedia[3]?.id || 'p1_img4',
-              start: segmentLen * 3,
-              end: segmentLen * 4,
-              locked: false,
-              confidence: 45, // FLAGGED: Non-perfect confidence match!
-              panZoomEffect: 'zoom-out'
-            },
-            {
-              id: `clip_strict_5_${Date.now()}`,
-              mediaId: usedMedia[4]?.id || 'p1_img5',
-              start: segmentLen * 4,
-              end: duration,
-              locked: false,
-              confidence: 100,
-              panZoomEffect: 'pan-right'
-            }
-          ];
-
           onUpdateProject({
             ...project,
             clips: finalClips,
+            mediaItems: updatedMediaItems,
             status: 'NEEDS_ATTENTION',
             progress: 100,
             lastSaved: 'Just now'
           });
-          appendAiMessage(`⚠️ **Strict Alignment Complete - Gaps & Low-Confidence Matches Found** \n\nOur High-Precision strict engine has executed with 0% tolerance. We flagged **2 segments** where perfect matches were not found. Approximate fills were prevented. Please review these flagged flaws in your **Sync Validation** dashboard for manual alignment or adjustment.`);
+          appendAiMessage(`⚠️ **Strict Alignment Complete - Gaps & Low-Confidence Matches Found** \n\nOur High-Precision strict engine has executed with 0% tolerance on your uploaded files. We flagged **low-confidence segments** where perfect matches were not found. Please review these flagged flaws in your timeline for manual adjustment.`);
         } else {
-          // Standard: perfect matches / approximate fills permitted
-          finalClips = [
-            {
-              id: `clip_std_1_${Date.now()}`,
-              mediaId: usedMedia[0]?.id || 'p1_img1',
-              start: 0,
-              end: segmentLen,
-              locked: false,
-              confidence: 100,
-              panZoomEffect: 'zoom-in'
-            },
-            {
-              id: `clip_std_2_${Date.now()}`,
-              mediaId: usedMedia[1]?.id || 'p1_img2',
-              start: segmentLen,
-              end: segmentLen * 2,
-              locked: false,
-              confidence: 100, // Approximate fill resolved to 100% perfect
-              panZoomEffect: 'pan-left'
-            },
-            {
-              id: `clip_std_3_${Date.now()}`,
-              mediaId: usedMedia[2]?.id || 'p1_img3',
-              start: segmentLen * 2,
-              end: segmentLen * 3,
-              locked: false,
-              confidence: 100,
-              panZoomEffect: 'none'
-            },
-            {
-              id: `clip_std_4_${Date.now()}`,
-              mediaId: usedMedia[3]?.id || 'p1_img4',
-              start: segmentLen * 3,
-              end: segmentLen * 4,
-              locked: false,
-              confidence: 100, // Approximate fill resolved to 100% perfect
-              panZoomEffect: 'zoom-out'
-            },
-            {
-              id: `clip_std_5_${Date.now()}`,
-              mediaId: usedMedia[4]?.id || 'p1_img5',
-              start: segmentLen * 4,
-              end: duration,
-              locked: false,
-              confidence: 100,
-              panZoomEffect: 'pan-right'
-            }
-          ];
-
           onUpdateProject({
             ...project,
             clips: finalClips,
+            mediaItems: updatedMediaItems,
             status: 'COMPLETE',
             progress: 100,
             lastSaved: 'Just now'
           });
-          appendAiMessage(`⚡ **AI Synchronization Sequence Completed** \n\nRecalculated match densities across all sections with 100% alignment precision. Gaps were successfully filled. Final timeline saved with zero-flaw reliability.`);
+          appendAiMessage(`⚡ **AI Synchronization Sequence Completed** \n\nRecalculated match densities across all sections with 100% alignment precision using your custom assets. Final timeline saved with zero-flaw reliability.`);
         }
       } else {
         onUpdateProject({ ...project, status: 'SYNCING', progress: progressVal });
@@ -905,44 +889,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         {/* PANE A: MEDIA LIBRARY (LEFT) */}
         <section id="workspace_media_library" className="w-80 border-r border-slate-200/40 bg-white/70 backdrop-blur-md flex flex-col shrink-0 overflow-hidden">
           
-          {/* Panel Tab Selector */}
-          <div className="flex border-b border-slate-200/30 bg-slate-50/65 p-1 shrink-0">
-            <button
-              id="left_pane_tab_catalog"
-              type="button"
-              onClick={() => setLeftPanelTab('catalog')}
-              className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all text-center flex items-center justify-center gap-1.5 cursor-pointer ${
-                leftPanelTab === 'catalog'
-                  ? 'bg-white text-slate-800 shadow-sm border border-slate-200/40 font-bold'
-                  : 'text-slate-400 hover:text-slate-600'
-              }`}
-            >
-              <Database className="w-3.5 h-3.5" />
-              Media Catalog
-            </button>
-            <button
-              id="left_pane_tab_validation"
-              type="button"
-              onClick={() => setLeftPanelTab('validation')}
-              className={`flex-1 py-2 rounded-lg text-xs font-bold transition-all text-center flex items-center justify-center gap-1.5 relative cursor-pointer ${
-                leftPanelTab === 'validation'
-                  ? 'bg-white text-slate-800 shadow-sm border border-slate-200/40 font-bold'
-                  : 'text-slate-400 hover:text-slate-600'
-              }`}
-            >
-              <CheckCircle2 className="w-3.5 h-3.5 text-amber-500" />
-              Sync Validation
-              {project.clips.some(c => c.confidence < 100) && (
-                <span className="absolute top-1.5 right-2 w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse" />
-              )}
-            </button>
-          </div>
-
-          {leftPanelTab === 'catalog' ? (
-            /* CATALOG TAB VIEW */
-            <div className="flex-1 flex flex-col overflow-hidden">
-              {/* Media Header & Stats */}
-              <div className="p-4 border-b border-slate-100 flex flex-col gap-2 shrink-0">
+          {/* Media Header & Stats */}
+          <div className="p-4 border-b border-slate-100 flex flex-col gap-2 shrink-0">
             <div className="flex items-center justify-between">
               <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400 font-mono flex items-center gap-1.5">
                 <Database className="w-3.5 h-3.5" />
@@ -954,27 +902,19 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
             </div>
 
             {/* Quick Stats list */}
-            <div className="grid grid-cols-4 gap-1 text-center text-[9px] font-mono text-slate-500 mt-1">
+            <div className="grid grid-cols-2 gap-1 text-center text-[9px] font-mono text-slate-500 mt-1">
               <div className="bg-white/40 p-1.5 rounded-lg border border-slate-200/40">
                 <div className="font-bold text-slate-800">{usedImagesCount}</div>
-                <div>Used</div>
+                <div>Used in Sync</div>
               </div>
               <div className="bg-white/40 p-1.5 rounded-lg border border-slate-200/40">
                 <div className="font-bold text-slate-800">{unusedImagesCount}</div>
                 <div>Unused</div>
               </div>
-              <div className="bg-white/40 p-1.5 rounded-lg border border-slate-200/40">
-                <div className="font-bold text-amber-600">{duplicateImagesCount}</div>
-                <div>Dups</div>
-              </div>
-              <div className="bg-white/40 p-1.5 rounded-lg border border-slate-200/40">
-                <div className="font-bold text-rose-500">{lowQualityImagesCount}</div>
-                <div>Low Q</div>
-              </div>
             </div>
 
             {/* Add Images Upload Area */}
-            <div className="mt-2 shrink-0">
+            <div className="mt-2 shrink-0 flex items-center gap-1.5">
               <input
                 ref={imageUploaderRef}
                 type="file"
@@ -987,11 +927,22 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
                 id="media_btn_add_images"
                 onClick={handleImageUploadTrigger}
                 disabled={isUploading}
-                className="w-full py-2 bg-white/40 hover:bg-white/70 border border-slate-300/60 border-dashed rounded-xl text-xs font-semibold text-slate-600 transition-all flex items-center justify-center gap-1.5"
+                className="flex-1 py-2 bg-blue-50/60 hover:bg-blue-100/80 border border-blue-200 text-[11px] font-bold text-blue-600 rounded-xl transition-all flex items-center justify-center gap-1.5 cursor-pointer"
               >
-                <Plus className="w-4 h-4 text-slate-400" />
-                Add Batch Images...
+                <Plus className="w-3.5 h-3.5" />
+                Add Images
               </button>
+              {project.mediaItems.some(m => !m.id.startsWith('user_img_')) && (
+                <button
+                  id="media_btn_clear_demo"
+                  onClick={handleClearDemoImages}
+                  className="px-2.5 py-2 bg-rose-50/60 hover:bg-rose-100 border border-rose-200 text-[11px] font-bold text-rose-600 rounded-xl transition-all flex items-center justify-center gap-1 cursor-pointer"
+                  title="Clear preset demo images to use only your uploaded ones"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  Clear Demo
+                </button>
+              )}
             </div>
 
             {/* Batch Upload Stream Progress */}
@@ -1015,16 +966,13 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
               {[
                 { id: 'all', label: 'All' },
                 { id: 'used', label: 'Used' },
-                { id: 'unused', label: 'Unused' },
-                { id: 'duplicate', label: 'Duplicates' },
-                { id: 'low_quality', label: 'Low Quality' },
-                { id: 'low_confidence', label: 'Weak Matches' }
+                { id: 'unused', label: 'Unused' }
               ].map((btn) => (
                 <button
                   key={btn.id}
                   id={`media_tab_${btn.id}`}
                   onClick={() => setMediaFilter(btn.id as any)}
-                  className={`px-2 py-0.5 rounded text-[10px] font-medium transition-all ${
+                  className={`px-2.5 py-0.5 rounded text-[10px] font-medium transition-all ${
                     mediaFilter === btn.id
                       ? 'bg-blue-600 text-white'
                       : 'bg-white/60 text-slate-500 border border-slate-200/60 hover:text-slate-800 hover:bg-white/80'
@@ -1180,221 +1128,6 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
               </div>
             )}
           </div>
-          </div>
-          ) : (
-            /* VALIDATION DASHBOARD TAB VIEW */
-            <div className="flex-1 flex flex-col overflow-hidden">
-              {/* Header and stats */}
-              <div className="p-4 border-b border-slate-100 bg-white/40 shrink-0 flex flex-col gap-2">
-                <div className="flex items-center justify-between">
-                  <h4 className="text-xs font-bold uppercase tracking-wider text-amber-600 font-mono flex items-center gap-1.5">
-                    <CheckCircle2 className="w-3.5 h-3.5" />
-                    Strict Sync Validation
-                  </h4>
-                  <span className="text-[10px] font-mono bg-amber-500/10 text-amber-700 px-1.5 py-0.5 rounded font-bold">
-                    {project.highPrecisionSync ? 'Strict Engine' : 'Standard'}
-                  </span>
-                </div>
-                <p className="text-[11px] text-slate-500 leading-normal">
-                  Scanning timeline tracks... Detected <strong>{project.clips.filter(c => c.confidence < 100).length}</strong> sync alignment anomalies.
-                </p>
-
-                {/* Segment Filter tabs */}
-                <div className="grid grid-cols-3 gap-1 bg-slate-100 p-0.5 rounded-lg text-[10px] font-mono mt-1 shrink-0">
-                  <button
-                    id="val_filter_all"
-                    type="button"
-                    onClick={() => setValidationFilter('all')}
-                    className={`py-1 rounded font-bold transition-all text-center cursor-pointer ${
-                      validationFilter === 'all'
-                        ? 'bg-white text-slate-800 shadow-xs'
-                        : 'text-slate-500 hover:text-slate-700'
-                    }`}
-                  >
-                    All ({project.clips.length})
-                  </button>
-                  <button
-                    id="val_filter_flagged"
-                    type="button"
-                    onClick={() => setValidationFilter('flagged')}
-                    className={`py-1 rounded font-bold transition-all text-center flex items-center justify-center gap-1 cursor-pointer ${
-                      validationFilter === 'flagged'
-                        ? 'bg-amber-500 text-white shadow-xs font-black'
-                        : 'text-slate-500 hover:text-amber-600'
-                    }`}
-                  >
-                    Flagged ({project.clips.filter(c => c.confidence < 100).length})
-                  </button>
-                  <button
-                    id="val_filter_perfect"
-                    type="button"
-                    onClick={() => setValidationFilter('perfect')}
-                    className={`py-1 rounded font-bold transition-all text-center flex items-center justify-center gap-1 cursor-pointer ${
-                      validationFilter === 'perfect'
-                        ? 'bg-emerald-600 text-white shadow-xs font-black'
-                        : 'text-slate-500 hover:text-emerald-600'
-                    }`}
-                  >
-                    Perfect ({project.clips.filter(c => c.confidence >= 100).length})
-                  </button>
-                </div>
-              </div>
-
-              {/* Scrollable validation list */}
-              <div className="flex-1 overflow-y-auto p-4 space-y-4 bg-slate-50/50">
-                {project.clips.length === 0 ? (
-                  <div className="text-center py-12 px-4 space-y-3 bg-white/60 rounded-2xl border border-slate-200/40">
-                    <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mx-auto border border-dashed border-slate-300">
-                      <Video className="w-6 h-6 animate-pulse" />
-                    </div>
-                    <div>
-                      <h5 className="text-xs font-bold text-slate-800 font-sans">No Segments Synced</h5>
-                      <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
-                        Click "Sync with AI" to generate timeline segments and evaluate their match confidence.
-                      </p>
-                    </div>
-                  </div>
-                ) : [...project.clips].filter(clip => {
-                    if (validationFilter === 'flagged') return clip.confidence < 100;
-                    if (validationFilter === 'perfect') return clip.confidence >= 100;
-                    return true;
-                  }).length === 0 ? (
-                    <div className="text-center py-12 px-4 space-y-3 bg-white/60 rounded-2xl border border-slate-200/40">
-                      <div className="w-12 h-12 rounded-full bg-slate-100 text-slate-400 flex items-center justify-center mx-auto border border-dashed border-slate-200">
-                        <Check className="w-6 h-6 text-emerald-500" />
-                      </div>
-                      <div>
-                        <h5 className="text-xs font-bold text-slate-800 font-sans">No matching segments</h5>
-                        <p className="text-[10px] text-slate-400 mt-1 leading-relaxed">
-                          No timeline segments match the selected filter (<strong>{validationFilter}</strong>).
-                         </p>
-                      </div>
-                    </div>
-                  ) : (
-                  <div className="space-y-3">
-                    {[...project.clips]
-                      .sort((a, b) => a.start - b.start)
-                      .filter(clip => {
-                        if (validationFilter === 'flagged') return clip.confidence < 100;
-                        if (validationFilter === 'perfect') return clip.confidence >= 100;
-                        return true;
-                      })
-                      .map((clip) => {
-                      const mediaItem = project.mediaItems.find(m => m.id === clip.mediaId);
-                      const isLowConfidence = clip.confidence < 100;
-                      return (
-                        <div 
-                          key={clip.id}
-                          className={`p-3 bg-white hover:bg-slate-50 border rounded-2xl shadow-xs transition-all space-y-3 relative group ${
-                            isLowConfidence 
-                              ? 'border-amber-300 bg-amber-500/[0.02]' 
-                              : 'border-slate-200/60'
-                          }`}
-                        >
-                          <div className="flex items-start gap-3">
-                            {/* Thumbnail */}
-                            {mediaItem ? (
-                              <img 
-                                src={mediaItem.url} 
-                                alt={mediaItem.name} 
-                                className="w-16 aspect-video object-cover rounded-lg border border-slate-200 shrink-0"
-                              />
-                            ) : (
-                              <div className="w-16 aspect-video bg-slate-100 rounded-lg flex items-center justify-center shrink-0 border border-dashed border-slate-300">
-                                <span className="text-[8px] text-slate-400 italic">No Media</span>
-                              </div>
-                            )}
-
-                            <div className="min-w-0 flex-1">
-                              <h5 className="text-[11px] font-bold text-slate-800 truncate leading-none">
-                                {mediaItem?.name || `Segment [${clip.start}s - ${clip.end}s]`}
-                              </h5>
-                              <div className="flex items-center gap-1.5 mt-2">
-                                <span className={`w-1.5 h-1.5 rounded-full ${isLowConfidence ? 'bg-amber-500 animate-pulse' : 'bg-emerald-500'}`} />
-                                <span className={`text-[10px] font-bold font-mono ${isLowConfidence ? 'text-amber-600' : 'text-emerald-600'}`}>
-                                  {isLowConfidence ? `Needs Alignment: ${clip.confidence}%` : 'Perfect Alignment (100%)'}
-                                </span>
-                              </div>
-                              <p className="text-[9px] text-slate-400 mt-1 font-mono">
-                                Interval: {clip.start}s - {clip.end}s ({clip.end - clip.start}s duration)
-                              </p>
-                            </div>
-                          </div>
-
-                          {/* Quick Alignment Action Controls */}
-                          <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-100">
-                            <button
-                              id={`val_jump_${clip.id}`}
-                              type="button"
-                              onClick={() => {
-                                setCurrentTime(clip.start);
-                                setSelectedClipId(clip.id);
-                                if (isLowConfidence) {
-                                  setChatInput(`Analyze this segment [${clip.start}s - ${clip.end}s] where alignment confidence is only ${clip.confidence}%. Optimize synchronization to 100%.`);
-                                } else {
-                                  setChatInput(`Explain why this segment [${clip.start}s - ${clip.end}s] has a perfect match score.`);
-                                }
-                              }}
-                              className="py-1.5 bg-slate-50 hover:bg-slate-100 border border-slate-200 text-slate-700 rounded-lg text-[10px] font-semibold text-center transition-all flex items-center justify-center gap-1 cursor-pointer"
-                            >
-                              <Video className="w-3 h-3 text-slate-500" />
-                              Jump & Inspect
-                            </button>
-                            {isLowConfidence ? (
-                              <button
-                                id={`val_resolve_${clip.id}`}
-                                type="button"
-                                onClick={() => {
-                                  // Simulate resolving flaw with AI immediately
-                                  setCurrentTime(clip.start);
-                                  setSelectedClipId(clip.id);
-                                  setMessages((prev) => [
-                                    ...prev,
-                                    {
-                                      id: `usr_${Date.now()}`,
-                                      sender: 'user',
-                                      text: `🛠️ **Resolve Sync Alignment Flaw [${clip.start}s - ${clip.end}s]**`,
-                                      timestamp: 'Just now'
-                                    }
-                                  ]);
-                                  setIsAiTyping(true);
-                                  appendAiMessage(`🛠️ **Sync Validation: Analyzing Alignment Flaw [${clip.start}s - ${clip.end}s]**\n\nChecking stereophonic audio landmarks for audio track "${project.audioName}" around marker time ${clip.start}s...\n\nNo matching visual descriptors were found in this strict-alignment segment. Replacing visual clip with a flawlessly aligned alternative.`);
-                                  
-                                  setTimeout(() => {
-                                    // Update clip confidence to 100%
-                                    const updatedClips = project.clips.map(c => 
-                                      c.id === clip.id ? { ...c, confidence: 100 } : c
-                                    );
-                                    onUpdateProject({
-                                      ...project,
-                                      clips: updatedClips,
-                                      status: updatedClips.every(c => c.confidence === 100) ? 'COMPLETE' : 'NEEDS_ATTENTION',
-                                      lastSaved: 'Just now'
-                                    });
-                                    setIsAiTyping(false);
-                                    appendAiMessage(`✅ **Sync Alignment Flaw Successfully Resolved!**\n\nI have matched an absolute perfect high-resolution video sequence from your catalog that matches the dynamic frequencies of the audio tracks perfectly at ${clip.start}s. The segment has been upgraded to **100% flawless confidence alignment**.`);
-                                  }, 1200);
-                                }}
-                                className="py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-[10px] font-semibold text-center transition-all flex items-center justify-center gap-1 cursor-pointer"
-                              >
-                                <Sparkles className="w-3 h-3 text-blue-200" />
-                                Auto-Fix with AI
-                              </button>
-                            ) : (
-                              <div className="py-1.5 bg-emerald-50 text-emerald-700 rounded-lg text-[10px] font-bold text-center flex items-center justify-center gap-1 border border-emerald-100">
-                                <Check className="w-3.5 h-3.5 text-emerald-500" />
-                                Aligned Flawlessly
-                              </div>
-                            )}
-                          </div>
-                        </div>
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
         </section>
 
         {/* CENTER PANE: PREVIEW VIEWPORT + AI CONTROLS */}

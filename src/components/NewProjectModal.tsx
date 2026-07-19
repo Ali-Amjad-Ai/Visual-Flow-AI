@@ -27,11 +27,19 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
   const [selectedFile, setSelectedFile] = useState<{ name: string; size: string; type: string } | null>(null);
   const [syncMode, setSyncMode] = useState<SyncMode>('DOCUMENTARY');
   const [duration, setDuration] = useState<number>(120); // default 2 mins
+  const [durationMin, setDurationMin] = useState<number>(2);
+  const [durationSec, setDurationSec] = useState<number>(0);
   const [isDragging, setIsDragging] = useState(false);
   
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   if (!isOpen) return null;
+
+  const updateDuration = (min: number, sec: number) => {
+    setDurationMin(min);
+    setDurationSec(sec);
+    setDuration(min * 60 + sec);
+  };
 
   // Preset quick selections for users to instantly try without uploading their own file
   const quickSelectFiles = [
@@ -89,6 +97,8 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
       type: 'audio/mpeg'
     });
     setDuration(file.duration);
+    setDurationMin(Math.floor(file.duration / 60));
+    setDurationSec(file.duration % 60);
     setProjectName(file.label);
   };
 
@@ -104,6 +114,8 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
     setSelectedFile(null);
     setSyncMode('DOCUMENTARY');
     setDuration(120);
+    setDurationMin(2);
+    setDurationSec(0);
     onClose();
   };
 
@@ -252,17 +264,37 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
 
             <div>
               <label className="block text-xs font-semibold uppercase tracking-wider text-slate-500 font-mono mb-2">
-                Simulated Run Duration (seconds)
+                Audio / Video Duration
               </label>
-              <input
-                id="modal_duration_input"
-                type="number"
-                min="30"
-                max="3600"
-                value={duration}
-                onChange={(e) => setDuration(Number(e.target.value))}
-                className="w-full px-3 py-2 text-xs text-slate-800 bg-white border border-slate-200 rounded-xl focus:outline-none focus:border-blue-500 focus:ring-2 focus:ring-blue-100 transition-all"
-              />
+              <div className="flex items-center gap-2">
+                <div className="flex-1 flex items-center gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
+                  <input
+                    id="modal_duration_min_input"
+                    type="number"
+                    min="0"
+                    max="60"
+                    value={durationMin}
+                    onChange={(e) => updateDuration(Number(e.target.value), durationSec)}
+                    className="w-full text-center text-xs font-bold text-slate-800 focus:outline-none bg-transparent"
+                  />
+                  <span className="text-[10px] text-slate-400 font-mono uppercase">min</span>
+                </div>
+                <div className="flex-1 flex items-center gap-2 bg-white border border-slate-200 rounded-xl px-3 py-2 focus-within:border-blue-500 focus-within:ring-2 focus-within:ring-blue-100 transition-all">
+                  <input
+                    id="modal_duration_sec_input"
+                    type="number"
+                    min="0"
+                    max="59"
+                    value={durationSec}
+                    onChange={(e) => updateDuration(durationMin, Number(e.target.value))}
+                    className="w-full text-center text-xs font-bold text-slate-800 focus:outline-none bg-transparent"
+                  />
+                  <span className="text-[10px] text-slate-400 font-mono uppercase">sec</span>
+                </div>
+              </div>
+              <p className="text-[10px] text-slate-400 mt-2 font-mono">
+                Total calculated duration: {duration} seconds. (E.g., if your audio is 7:53, set to 7 min and 53 sec).
+              </p>
             </div>
           </div>
 
