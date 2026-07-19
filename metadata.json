@@ -1,0 +1,6 @@
+{
+  "name": "VisualFlow AI",
+  "description": "Premium AI-powered visual synchronization studio that automatically aligns images to your audio/video timeline with professional creative controls.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>VisualFlow AI — Premium AI Visual Synchronization Studio</title>
+    <script>
+      // Prevent "Cannot set property fetch of #<Window> which has only a getter" in sandboxed iframe previews
+      (function() {
+        try {
+          var win = window;
+          var originalFetch = win.fetch;
+          var customFetch = undefined;
+
+          // Define window.fetch with getter/setter to safely support overriding by polyfills
+          Object.defineProperty(win, 'fetch', {
+            get: function() {
+              return customFetch || originalFetch;
+            },
+            set: function(val) {
+              customFetch = val;
+            },
+            configurable: true,
+            enumerable: true
+          });
+
+          // Also define a global safe reference if some packages look for 'global'
+          if (typeof win.global === 'undefined') {
+            Object.defineProperty(win, 'global', {
+              get: function() { return win; },
+              set: function(val) { /* allow */ },
+              configurable: true
+            });
+          }
+        } catch (e) {
+          console.warn('Sandbox fetch patch failed:', e);
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+
