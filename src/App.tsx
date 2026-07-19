@@ -82,7 +82,8 @@ export default function App() {
     fileName: string, 
     fileSize: string, 
     mode: SyncMode, 
-    customDuration: number
+    customDuration: number,
+    audioUrl?: string
   ) => {
     // Generate some initial random image assets for this new project to let user play with immediately!
     const categories = ['LOCATIONS', 'PEOPLE', 'OBJECTS', 'EVENTS', 'NATURE', 'BUSINESS', 'ARCHITECTURE'];
@@ -143,6 +144,7 @@ export default function App() {
       duration: customDuration,
       audioName: fileName,
       audioSize: fileSize,
+      audioUrl,
       status: 'NEEDS_ATTENTION',
       progress: 0,
       lastSaved: 'Just now',

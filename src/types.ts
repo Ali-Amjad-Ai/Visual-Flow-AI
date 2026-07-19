@@ -85,6 +85,7 @@ export interface Project {
   duration: number; // total duration in seconds
   audioName: string;
   audioSize: string;
+  audioUrl?: string;
   status: ProjectStatus;
   progress: number; // overall AI workflow progress %
   lastSaved: string;

@@ -100,6 +100,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   const playerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const imageUploaderRef = useRef<HTMLInputElement>(null);
+  const audioRef = useRef<HTMLAudioElement | null>(null);
 
   // Find currently active timeline clip and active section based on current playhead time
   const activeClip = project.clips.find(clip => currentTime >= clip.start && currentTime < clip.end);
@@ -113,6 +114,22 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
   // Video Player Playback loop
   useEffect(() => {
+    if (project.audioUrl) {
+      if (!audioRef.current) return;
+      audioRef.current.playbackRate = playbackSpeed;
+      audioRef.current.muted = isMuted;
+
+      if (isPlaying) {
+        audioRef.current.play().catch(err => {
+          console.warn("Audio playback failed or interrupted:", err);
+        });
+      } else {
+        audioRef.current.pause();
+      }
+      return;
+    }
+
+    // Fallback interval-based timer for projects without real audio files (e.g., presets)
     if (isPlaying) {
       const stepMs = 100 / playbackSpeed;
       playerIntervalRef.current = setInterval(() => {
@@ -134,12 +151,37 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     return () => {
       if (playerIntervalRef.current) clearInterval(playerIntervalRef.current);
     };
-  }, [isPlaying, playbackSpeed, project.duration]);
+  }, [isPlaying, playbackSpeed, project.duration, project.audioUrl, isMuted]);
 
-  // Voice Synthesis Narrator (Web Speech API)
+  // Synchronize audio current time when state changes and differs significantly
+  useEffect(() => {
+    if (project.audioUrl && audioRef.current) {
+      const diff = Math.abs(audioRef.current.currentTime - currentTime);
+      if (diff > 0.3) {
+        audioRef.current.currentTime = currentTime;
+      }
+    }
+  }, [currentTime, project.audioUrl]);
+
+  // Sync volume / speed on changes
+  useEffect(() => {
+    if (project.audioUrl && audioRef.current) {
+      audioRef.current.playbackRate = playbackSpeed;
+      audioRef.current.muted = isMuted;
+    }
+  }, [playbackSpeed, isMuted, project.audioUrl]);
+
+  // Voice Synthesis Narrator (Web Speech API) - only for projects without real audio
   const lastSpokenSectionIdRef = useRef<string | null>(null);
 
   useEffect(() => {
+    // If there is an actual audio track, do not use speech synthesis
+    if (project.audioUrl) {
+      window.speechSynthesis.cancel();
+      lastSpokenSectionIdRef.current = null;
+      return;
+    }
+
     // If paused, or muted, or no active section, cancel speech
     if (!isPlaying || isMuted || !activeSection) {
       window.speechSynthesis.cancel();
@@ -164,7 +206,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
       window.speechSynthesis.speak(utterance);
     }
-  }, [isPlaying, activeSection, isMuted, playbackSpeed]);
+  }, [isPlaying, activeSection, isMuted, playbackSpeed, project.audioUrl]);
 
   // Clean up speech on unmount
   useEffect(() => {
@@ -251,7 +293,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
                 newlyAdded.push({
                   id,
                   name: file.name,
-                  url: getSvgPlaceholder(file.name.split('.')[0], chosenCat, 'indigo'),
+                  url: URL.createObjectURL(file),
                   type: 'image',
                   size: fileMb,
                   status: 'unused', // uploaded files are unused initially
@@ -789,6 +831,20 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     setCurrentTime(prev => Math.max(0, Math.min(project.duration, prev + amount)));
   };
 
+  const handleAudioTimeUpdate = () => {
+    if (audioRef.current && isPlaying) {
+      setCurrentTime(audioRef.current.currentTime);
+    }
+  };
+
+  const handleAudioEnded = () => {
+    setIsPlaying(false);
+    setCurrentTime(0);
+    if (audioRef.current) {
+      audioRef.current.currentTime = 0;
+    }
+  };
+
   const handleRulerClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!timelineRulerRef.current) return;
     const rect = timelineRulerRef.current.getBoundingClientRect();
@@ -799,6 +855,17 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
   return (
     <div id="studio_workspace" className="flex-1 flex flex-col bg-transparent overflow-hidden h-screen select-none">
+      {/* Real audio element to play custom uploaded narrations */}
+      {project.audioUrl && (
+        <audio
+          ref={audioRef}
+          src={project.audioUrl}
+          preload="auto"
+          onTimeUpdate={handleAudioTimeUpdate}
+          onEnded={handleAudioEnded}
+          className="hidden"
+        />
+      )}
       
       {/* 1. Header Toolbar */}
       <header className="h-14 bg-white/70 backdrop-blur-md border-b border-slate-200/40 px-6 shrink-0 flex items-center justify-between">

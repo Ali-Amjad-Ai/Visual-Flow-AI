@@ -19,12 +19,12 @@ import { SyncMode } from '../types';
 interface NewProjectModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onCreateProject: (projectName: string, fileName: string, fileSize: string, mode: SyncMode, customDuration: number) => void;
+  onCreateProject: (projectName: string, fileName: string, fileSize: string, mode: SyncMode, customDuration: number, audioUrl?: string) => void;
 }
 
 export default function NewProjectModal({ isOpen, onClose, onCreateProject }: NewProjectModalProps) {
   const [projectName, setProjectName] = useState('');
-  const [selectedFile, setSelectedFile] = useState<{ name: string; size: string; type: string } | null>(null);
+  const [selectedFile, setSelectedFile] = useState<{ name: string; size: string; type: string; fileObject?: File } | null>(null);
   const [syncMode, setSyncMode] = useState<SyncMode>('DOCUMENTARY');
   const [duration, setDuration] = useState<number>(120); // default 2 mins
   const [durationMin, setDurationMin] = useState<number>(2);
@@ -67,7 +67,8 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
       setSelectedFile({
         name: file.name,
         size: sizeMB,
-        type: file.type
+        type: file.type,
+        fileObject: file
       });
       if (!projectName) {
         setProjectName(file.name.split('.')[0].replace(/_/g, ' '));
@@ -82,7 +83,8 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
       setSelectedFile({
         name: file.name,
         size: sizeMB,
-        type: file.type
+        type: file.type,
+        fileObject: file
       });
       if (!projectName) {
         setProjectName(file.name.split('.')[0].replace(/_/g, ' '));
@@ -107,7 +109,8 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
     if (!selectedFile) return;
 
     const finalName = projectName.trim() || selectedFile.name.split('.')[0].replace(/_/g, ' ');
-    onCreateProject(finalName, selectedFile.name, selectedFile.size, syncMode, duration);
+    const audioUrl = selectedFile.fileObject ? URL.createObjectURL(selectedFile.fileObject) : '';
+    onCreateProject(finalName, selectedFile.name, selectedFile.size, syncMode, duration, audioUrl);
     
     // Reset form
     setProjectName('');
