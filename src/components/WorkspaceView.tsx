@@ -475,7 +475,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
           entry.lastAccessed = performance.now();
 
           // If this was the active clip, trigger a late sync swap!
-          const active = findActiveClip(currentTimeRef.current);
+          const offsetTime = Math.max(0, Math.min(project.duration, currentTimeRef.current + syncOffsetRef.current));
+          const active = findActiveClip(offsetTime);
           if (active) {
             const activeMedia = project.mediaItems.find(m => m.id === active.mediaId);
             if (activeMedia && activeMedia.url === entry.url) {
@@ -530,8 +531,9 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     });
 
     // 2. Compute dynamic priorities for each cache entry based on temporal proximity to the playhead
+    const offsetTime = Math.max(0, Math.min(project.duration, time + syncOffsetRef.current));
     const priorities = new Map<string, { score: number; targetClip: TimelineClip; index: number }>();
-    const activeClip = findActiveClip(time);
+    const activeClip = findActiveClip(offsetTime);
 
     // Filter upcoming and compute proximity
     project.clips.forEach((clip, index) => {
@@ -544,8 +546,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       if (activeClip && activeClip.id === clip.id) {
         // High priority: the current active clip
         score = 1000;
-      } else if (clip.start > time) {
-        const timeDiff = clip.start - time;
+      } else if (clip.start > offsetTime) {
+        const timeDiff = clip.start - offsetTime;
         if (timeDiff <= 3.0) {
           // Priority 2: upcoming clips within lookahead (sorted by proximity)
           score = 500 - (timeDiff * 50); // scales from 500 down to 350
@@ -650,8 +652,11 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       debugDiffRef.current.className = `${diffCategory.color} font-bold`;
     }
 
+    // Apply dynamic timing calibration offset to visuals and subtitles
+    const offsetTime = Math.max(0, Math.min(project.duration, time + syncOffsetRef.current));
+
     // 4. Boundary detection for active visual clip & Direct-DOM frame swapper
-    const active = findActiveClip(time);
+    const active = findActiveClip(offsetTime);
     const activeId = active ? active.id : null;
     
     // Check if the current visible clip ID is different from the active clip ID
@@ -745,18 +750,19 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         // STRICT TRANSITION LOGIC BARRIER:
         if (isAlreadyDecoded) {
           const t3_perf = performance.now();
+          const previousActiveClipId = activeClipIdRef.current;
           commitSwap(t3_perf);
           
           // Record successful immediate transition audit
-          if (activeClipIdRef.current !== activeId) {
-            activeClipIdRef.current = activeId;
+          if (previousActiveClipId !== activeId) {
             recordTransitionAudit(active!, targetUrl, true, cached);
           }
         } else {
           // STRICT BARRIER: Target image is NOT decoded yet!
           // 1. Keep the current visual frame (do NOT swap image buffers)
           // 2. Record a missed-readiness event if we just crossed into this new clip
-          if (activeClipIdRef.current !== activeId) {
+          const previousActiveClipId = activeClipIdRef.current;
+          if (previousActiveClipId !== activeId) {
             activeClipIdRef.current = activeId;
             recordTransitionAudit(active!, targetUrl, false, cached);
             
@@ -790,7 +796,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     }
 
     // 5. Boundary detection for active section subtitle
-    const activeSec = project.sections.find(sec => time >= sec.start && time < sec.end);
+    const activeSec = project.sections.find(sec => offsetTime >= sec.start && offsetTime < sec.end);
     const activeSecId = activeSec ? activeSec.id : null;
     if (activeSecId !== activeSectionIdRef.current) {
       activeSectionIdRef.current = activeSecId;
@@ -2362,30 +2368,30 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
                       <span className="text-blue-400 font-bold font-mono text-xs">{(syncOffset * 1000).toFixed(0)} ms</span>
                     </div>
                     <div className="flex items-center gap-3">
-                      <span className="text-slate-500 text-[10px] shrink-0">-500ms (Early)</span>
+                      <span className="text-slate-500 text-[10px] shrink-0">-2000ms (Early)</span>
                       <input 
                         type="range"
-                        min="-0.500"
-                        max="0.500"
+                        min="-2.000"
+                        max="2.000"
                         step="0.010"
                         value={syncOffset}
                         onChange={(e) => changeSyncOffset(parseFloat(e.target.value))}
                         className="flex-1 accent-blue-500 h-1 bg-slate-855 rounded-lg cursor-pointer"
                       />
-                      <span className="text-slate-500 text-[10px] shrink-0">+500ms (Late)</span>
+                      <span className="text-slate-500 text-[10px] shrink-0">+2000ms (Late)</span>
                     </div>
                     <div className="flex items-center justify-between gap-1.5 mt-1">
                       <button 
-                        onClick={() => changeSyncOffset(Math.max(-0.5, syncOffset - 0.05))}
+                        onClick={() => changeSyncOffset(Math.max(-2.0, syncOffset - 0.500))}
                         className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
                       >
-                        -50ms Nudge
+                        -500ms
                       </button>
                       <button 
-                        onClick={() => changeSyncOffset(Math.max(-0.5, syncOffset - 0.01))}
+                        onClick={() => changeSyncOffset(Math.max(-2.0, syncOffset - 0.100))}
                         className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
                       >
-                        -10ms Nudge
+                        -100ms
                       </button>
                       <button 
                         onClick={() => changeSyncOffset(0)}
@@ -2394,16 +2400,16 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
                         Reset (0)
                       </button>
                       <button 
-                        onClick={() => changeSyncOffset(Math.min(0.5, syncOffset + 0.01))}
+                        onClick={() => changeSyncOffset(Math.min(2.0, syncOffset + 0.100))}
                         className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
                       >
-                        +10ms Nudge
+                        +100ms
                       </button>
                       <button 
-                        onClick={() => changeSyncOffset(Math.min(0.5, syncOffset + 0.05))}
+                        onClick={() => changeSyncOffset(Math.min(2.0, syncOffset + 0.500))}
                         className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
                       >
-                        +50ms Nudge
+                        +500ms
                       </button>
                     </div>
                   </div>
@@ -2769,7 +2775,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
                 const widthPercent = ((clip.end - clip.start) / project.duration) * 100;
                 const leftPercent = (clip.start / project.duration) * 100;
                 
-                const isClipActive = currentTime >= clip.start && currentTime < clip.end;
+                const isClipActive = activeClipState?.id === clip.id;
                 const isHighlighted = selectedClipId === clip.id;
 
                 let borderTheme = 'border-slate-200';
