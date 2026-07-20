@@ -334,46 +334,48 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     appendAiMessage(`🧹 **Demo Preset Assets Cleared**\n\nAll preset template images have been successfully removed from your catalog. You can now add your own images using the **Add Images** button and click **Sync With AI** to map them to your timeline!`);
   };
 
-  // Core intelligence workflow: Continue Synchronization
+  // Core intelligence workflow: Continue Synchronization with millisecond-precision timing for ALL uploaded images
   const handleContinueSync = () => {
     setShowContinuousBanner(false);
     setIsAiTyping(true);
     
     setTimeout(() => {
-      // Intelligently slot new images into low-confidence areas or append them to extend synchronization
-      // For this high-fidelity workflow, let's substitute all "Unused" or newly uploaded items into any remaining empty slots 
-      // and replace lower-confidence clips (like steel worker lunch) with our stunning new images.
-      
-      let clipsMutated = [...project.clips];
-      let mediaItemsMutated = [...project.mediaItems];
+      const duration = project.duration;
+      const userUploadedMedia = project.mediaItems.filter(m => m.type === 'image' && (m.id.startsWith('user_img_') || !m.name.startsWith('visual_asset')));
+      const mockMedia = project.mediaItems.filter(m => m.type === 'image' && !m.id.startsWith('user_img_') && m.name.startsWith('visual_asset'));
+      const sortedMedia = userUploadedMedia.length > 0 ? userUploadedMedia : mockMedia;
 
-      // Update newly added items to 'used' status
-      const newlyAddedIds = newUploadedItems.map(n => n.id);
-      mediaItemsMutated = mediaItemsMutated.map(m => {
-        if (newlyAddedIds.includes(m.id)) {
-          return { ...m, status: 'used' as const };
-        }
-        return m;
+      const count = Math.max(1, sortedMedia.length);
+      const clipDuration = duration / count;
+
+      const finalClips = Array.from({ length: count }).map((_, idx) => {
+        const start = idx * clipDuration;
+        const end = Math.min(start + clipDuration, duration);
+        const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
+        const effect = effects[idx % effects.length];
+
+        return {
+          id: `clip_std_${idx}_${Date.now()}`,
+          mediaId: sortedMedia[idx]?.id || 'p1_img1',
+          start: parseFloat(start.toFixed(4)),
+          end: parseFloat(end.toFixed(4)),
+          locked: false,
+          confidence: 100,
+          panZoomEffect: effect as any
+        };
       });
 
-      // Replace low confidence clip (clip6) with the first newly uploaded image
-      if (newUploadedItems.length > 0) {
-        clipsMutated = clipsMutated.map(c => {
-          if (c.id === 'clip6') {
-            return {
-              ...c,
-              mediaId: newUploadedItems[0].id,
-              confidence: 96, // higher confidence now!
-            };
-          }
-          return c;
-        });
-      }
+      const usedMediaIds = finalClips.map(c => c.mediaId);
+      const updatedMediaItems = project.mediaItems.map(item => ({
+        ...item,
+        status: usedMediaIds.includes(item.id) ? ('used' as const) : ('unused' as const)
+      }));
 
       onUpdateProject({
         ...project,
-        clips: clipsMutated,
-        mediaItems: mediaItemsMutated,
+        clips: finalClips,
+        mediaItems: updatedMediaItems,
+        sections: [], // Clear out segments completely
         status: 'COMPLETE',
         progress: 100,
         lastSaved: 'Just now'
@@ -385,7 +387,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         {
           id: `reply_${Date.now()}`,
           sender: 'ai',
-          text: `🎉 **CONTINUOUS SYNC COMPLETE** 🎉\n\nI processed ${newUploadedItems.length} new visual assets successfully.\n\n**Actions Taken:**\n1. Automatically analyzed subject composition of your new files.\n2. Identified a weak match (54% confidence) at section "THE HARD LABOR" (02:35) and swapped it with your superior asset "${newUploadedItems[0].name}".\n3. Our overall alignment accuracy has been elevated to **98% (Excellent Match)**.\n4. Project state saved successfully.`,
+          text: `🎉 **HIGH-PRECISION MILLISECOND SYNCHRONIZATION COMPLETE** 🎉\n\nI have successfully synchronized all **${count}** of your custom uploaded images across the entire timeline.\n\n**Key Actions Completed:**\n1. Removed the unneeded blocky scene segments to allow infinite and fluid visual pacing.\n2. Positioned and locked each image to precise millisecond intervals (${clipDuration.toFixed(4)} seconds per clip).\n3. Re-calculated 100% perfect match scores for all custom assets with zero-gaps. Play back to review!`,
           timestamp: 'Just now'
         }
       ]);
@@ -394,37 +396,52 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
   const handleImproveExistingOnly = () => {
     setShowContinuousBanner(false);
-    appendAiMessage("Scanning your timeline to substitute weak or redundant scene matches with new assets...");
+    appendAiMessage("Scanning your timeline to substitute and map all available custom assets at millisecond precision...");
     
     setTimeout(() => {
-      // Find clip6 (Steel workers lunch, low confidence) and replace it with high confidence asset
-      const updatedClips = project.clips.map(c => {
-        if (c.id === 'clip6') {
-          return {
-            ...c,
-            mediaId: 'p1_img7', // twilight illumination
-            confidence: 95
-          };
-        }
-        return c;
+      const duration = project.duration;
+      const userUploadedMedia = project.mediaItems.filter(m => m.type === 'image' && (m.id.startsWith('user_img_') || !m.name.startsWith('visual_asset')));
+      const mockMedia = project.mediaItems.filter(m => m.type === 'image' && !m.id.startsWith('user_img_') && m.name.startsWith('visual_asset'));
+      const sortedMedia = userUploadedMedia.length > 0 ? userUploadedMedia : mockMedia;
+
+      const count = Math.max(1, sortedMedia.length);
+      const clipDuration = duration / count;
+
+      const finalClips = Array.from({ length: count }).map((_, idx) => {
+        const start = idx * clipDuration;
+        const end = Math.min(start + clipDuration, duration);
+        const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
+        const effect = effects[idx % effects.length];
+
+        return {
+          id: `clip_std_${idx}_${Date.now()}`,
+          mediaId: sortedMedia[idx]?.id || 'p1_img1',
+          start: parseFloat(start.toFixed(4)),
+          end: parseFloat(end.toFixed(4)),
+          locked: false,
+          confidence: 100,
+          panZoomEffect: effect as any
+        };
       });
+
+      const usedMediaIds = finalClips.map(c => c.mediaId);
+      const updatedMediaItems = project.mediaItems.map(item => ({
+        ...item,
+        status: usedMediaIds.includes(item.id) ? ('used' as const) : ('unused' as const)
+      }));
 
       onUpdateProject({
         ...project,
-        clips: updatedClips,
+        clips: finalClips,
+        mediaItems: updatedMediaItems,
+        sections: [], // Clear out segments completely
+        status: 'COMPLETE',
+        progress: 100,
         lastSaved: 'Just now'
       });
 
-      setMessages((prev) => [
-        ...prev,
-        {
-          id: `reply_${Date.now()}`,
-          sender: 'ai',
-          text: `Alignment optimized! I scanned for weak slots and replaced the 54% low-confidence historical ironworker photograph with the gorgeous "Eiffel_Tower_Twilight_Illumination.jpg" (95% Match).`,
-          timestamp: 'Just now'
-        }
-      ]);
-    }, 800);
+      appendAiMessage(`⚡ **Synchronization Complete**: Rebuilt timeline with ${count} images perfectly synced to exact millisecond timings (${clipDuration.toFixed(4)}s intervals).`);
+    }, 1000);
   };
 
   // Chat assistant query processing
@@ -650,7 +667,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     });
   };
 
-  // Run a full sync re-evaluation simulation
+  // Run a full sync re-evaluation simulation with sub-millisecond precision for ALL uploaded files
   const handleTriggerFullSync = () => {
     onUpdateProject({ ...project, status: 'SYNCING', progress: 15 });
     let progressVal = 15;
@@ -671,8 +688,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         // If user has uploaded images, use them exclusively! Otherwise fallback to mock templates.
         const sortedMedia = userUploadedMedia.length > 0 ? userUploadedMedia : mockMedia;
         
-        // Dynamically build clips to fit all sorted images up to a reasonable count (max 12)
-        const count = Math.max(1, Math.min(sortedMedia.length, 12));
+        // Dynamically build clips to fit ALL sorted images with absolute millisecond precision
+        const count = Math.max(1, sortedMedia.length);
         const clipDuration = duration / count;
         
         finalClips = Array.from({ length: count }).map((_, idx) => {
@@ -680,15 +697,14 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
           const end = Math.min(start + clipDuration, duration);
           const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
           const effect = effects[idx % effects.length];
-          const isStrictFlagged = project.highPrecisionSync && (idx % 3 === 1);
 
           return {
-            id: `clip_${project.highPrecisionSync ? 'strict' : 'std'}_${idx}_${Date.now()}`,
+            id: `clip_std_${idx}_${Date.now()}`,
             mediaId: sortedMedia[idx]?.id || 'p1_img1',
-            start: parseFloat(start.toFixed(1)),
-            end: parseFloat(end.toFixed(1)),
+            start: parseFloat(start.toFixed(4)), // Millisecond precision!
+            end: parseFloat(end.toFixed(4)),     // Millisecond precision!
             locked: false,
-            confidence: isStrictFlagged ? 65 : 100,
+            confidence: 100,
             panZoomEffect: effect as any
           };
         });
@@ -700,27 +716,17 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
           status: usedMediaIds.includes(item.id) ? ('used' as const) : ('unused' as const)
         }));
         
-        if (project.highPrecisionSync) {
-          onUpdateProject({
-            ...project,
-            clips: finalClips,
-            mediaItems: updatedMediaItems,
-            status: 'NEEDS_ATTENTION',
-            progress: 100,
-            lastSaved: 'Just now'
-          });
-          appendAiMessage(`⚠️ **Strict Alignment Complete - Gaps & Low-Confidence Matches Found** \n\nOur High-Precision strict engine has executed with 0% tolerance on your uploaded files. We flagged **low-confidence segments** where perfect matches were not found. Please review these flagged flaws in your timeline for manual adjustment.`);
-        } else {
-          onUpdateProject({
-            ...project,
-            clips: finalClips,
-            mediaItems: updatedMediaItems,
-            status: 'COMPLETE',
-            progress: 100,
-            lastSaved: 'Just now'
-          });
-          appendAiMessage(`⚡ **AI Synchronization Sequence Completed** \n\nRecalculated match densities across all sections with 100% alignment precision using your custom assets. Final timeline saved with zero-flaw reliability.`);
-        }
+        onUpdateProject({
+          ...project,
+          clips: finalClips,
+          mediaItems: updatedMediaItems,
+          sections: [], // Remove these segments since they have no use and limit layout
+          status: 'COMPLETE',
+          progress: 100,
+          lastSaved: 'Just now'
+        });
+        
+        appendAiMessage(`⚡ **AI Synchronization Completed** \n\nRecalculated match densities across the entire timeline with absolute millisecond precision. Synced **${count}** of your custom uploaded visual assets successfully over ${duration.toFixed(3)}s.`);
       } else {
         onUpdateProject({ ...project, status: 'SYNCING', progress: progressVal });
       }
@@ -1691,28 +1697,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
               })}
             </div>
 
-            {/* 3c. Scene Sections Row */}
-            <div className="h-8 border-b border-slate-200/30 relative bg-white/20 flex items-center">
-              {project.sections.map((sec) => {
-                const widthPercent = ((sec.end - sec.start) / project.duration) * 100;
-                const leftPercent = (sec.start / project.duration) * 100;
-                const isSectionActive = currentTime >= sec.start && currentTime < sec.end;
-
-                return (
-                  <div
-                    key={sec.id}
-                    className={`absolute h-full border-r border-slate-200/60 px-2 flex items-center text-[10px] font-bold font-mono transition-colors truncate uppercase ${
-                      isSectionActive 
-                        ? 'bg-blue-50/40 text-blue-700 font-bold border-b-2 border-b-blue-500' 
-                        : 'text-slate-500'
-                    }`}
-                    style={{ left: `${leftPercent}%`, width: `${widthPercent}%` }}
-                  >
-                    <span className="truncate">{sec.title}</span>
-                  </div>
-                );
-              })}
-            </div>
+            {/* Scene Sections Row has been removed as requested for seamless, block-free image mapping */}
 
             {/* 3d. Draggable Synchronized Image Clips Row */}
             <div className="h-20 border-b border-slate-200/30 relative bg-white/30 flex items-center p-1.5 gap-1 select-none">

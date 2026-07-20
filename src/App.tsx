@@ -108,9 +108,9 @@ export default function App() {
       };
     });
 
-    // Create a mock section timeline based on duration
+    // Create a mock section timeline based on duration (only for mock presets/empty projects; bypass for custom uploaded tracks)
     const sectionDuration = Math.floor(customDuration / 3);
-    const mockSections = [
+    const mockSections = audioUrl ? [] : [
       {
         id: `sec_1_${Date.now()}`,
         title: 'SCENE SEGMENT 1',
