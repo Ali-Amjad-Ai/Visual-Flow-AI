@@ -102,18 +102,37 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   const imageUploaderRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
-  // HIGH-PRECISION RE-ANCHORING & TIMELINE LOOKUP ENGINE
-  const playAnchorRef = useRef<{ audioTime: number; perfTime: number } | null>(null);
-  const lastAnchorSyncTimeRef = useRef<number>(0);
+  // HIGH-PERFORMANCE HIGH-PRECISION DIRECT TIMING ENGINE
+  const currentTimeRef = useRef<number>(0);
+  const playheadRef = useRef<HTMLDivElement | null>(null);
+  const clockRef = useRef<HTMLSpanElement | null>(null);
+  const debugClockRef = useRef<HTMLSpanElement | null>(null);
+  const debugVisualClockRef = useRef<HTMLSpanElement | null>(null);
+  const debugDiffRef = useRef<HTMLSpanElement | null>(null);
+  const debugClipIdxRef = useRef<HTMLSpanElement | null>(null);
+  const debugClipStartRef = useRef<HTMLSpanElement | null>(null);
+  const debugClipEndRef = useRef<HTMLSpanElement | null>(null);
+  const debugStateRef = useRef<HTMLSpanElement | null>(null);
+  const debugFrameRef = useRef<HTMLSpanElement | null>(null);
+
+  const activeClipIdRef = useRef<string | null>(null);
+  const activeSectionIdRef = useRef<string | null>(null);
+  
+  const renderFrameRef = useRef<number>(0);
   const isSeekingRef = useRef<boolean>(false);
   const generationRef = useRef<number>(1);
   const lastPreloadTimeRef = useRef<number>(0);
   const activeMediaGenRef = useRef<number>(0);
+
+  const [activeClipState, setActiveClipState] = useState<TimelineClip | null>(null);
+  const [activeSectionState, setActiveSectionState] = useState<Section | null>(null);
+  const [showDebugger, setShowDebugger] = useState<boolean>(true); // Dev sync debugger overlay
   const preloadCache = useRef<Map<string, {
     url: string;
     img: HTMLImageElement;
     status: 'loading' | 'decoded' | 'error';
     generation: number;
+    lastAccessed?: number;
   }>>(new Map());
 
   // DOUBLE BUFFERED IMAGE LAYER STATE
@@ -144,17 +163,41 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     return clips.find(clip => time >= clip.start && time < clip.end) || null;
   };
 
-  // Find currently active timeline clip and active section based on current playhead time
-  const activeClip = findActiveClip(currentTime);
+  const activeClip = activeClipState;
   const activeMedia = activeClip ? project.mediaItems.find(m => m.id === activeClip.mediaId) : null;
-  const activeSection = project.sections.find(sec => currentTime >= sec.start && currentTime < sec.end);
+  const activeSection = activeSectionState;
+
+  const formatTime = (time: number) => {
+    const mins = Math.floor(time / 60);
+    const secs = Math.floor(time % 60);
+    const ms = Math.floor((time % 1) * 1000);
+    return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+  };
+
+  // Sync state on project load / mount
+  useEffect(() => {
+    const initialClip = findActiveClip(currentTime);
+    const initialSec = project.sections.find(sec => currentTime >= sec.start && currentTime < sec.end);
+    setActiveClipState(initialClip);
+    setActiveSectionState(initialSec);
+    activeClipIdRef.current = initialClip ? initialClip.id : null;
+    activeSectionIdRef.current = initialSec ? initialSec.id : null;
+    currentTimeRef.current = currentTime;
+    
+    if (playheadRef.current) {
+      playheadRef.current.style.left = `${(currentTime / project.duration) * 100}%`;
+    }
+    if (clockRef.current) {
+      clockRef.current.textContent = formatTime(currentTime);
+    }
+  }, [project.id]);
 
   // Scroll to chat bottom on new messages
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isAiTyping]);
 
-  // Rolling lookahead preloader and decoder cache to avoid white frame flickering
+  // Rolling lookahead preloader and decoder cache with memory-safe LRU eviction
   const runPreloadAndDecode = (time: number, force = false) => {
     // Throttle high-frequency updates during continuous playback (run once every 200ms)
     if (!force && Math.abs(time - lastPreloadTimeRef.current) < 0.2) {
@@ -174,6 +217,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     const active = findActiveClip(time);
     const clipsToPreload = active ? [active, ...upcomingClips] : upcomingClips;
 
+    const nowTime = performance.now();
     clipsToPreload.forEach(clip => {
       const media = project.mediaItems.find(m => m.id === clip.mediaId);
       if (!media || !media.url) return;
@@ -181,6 +225,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       const url = media.url;
       if (preloadCache.current.has(url)) {
         const entry = preloadCache.current.get(url)!;
+        entry.lastAccessed = nowTime; // Update LRU access timestamp
         if (entry.status === 'decoded' || entry.status === 'loading') {
           return;
         }
@@ -193,11 +238,13 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         img: HTMLImageElement;
         status: 'loading' | 'decoded' | 'error';
         generation: number;
+        lastAccessed: number;
       } = {
         url,
         img,
         status: 'loading',
-        generation: currentGen
+        generation: currentGen,
+        lastAccessed: nowTime
       };
       preloadCache.current.set(url, entry);
 
@@ -214,7 +261,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         });
     });
 
-    // Clean up older cached items outside of active window
+    // Memory-Safe LRU Eviction Policy (Max 15 decoded images in memory)
     const activeUrls = new Set(
       clipsToPreload.map(clip => {
         const m = project.mediaItems.find(mi => mi.id === clip.mediaId);
@@ -222,10 +269,85 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       }).filter(Boolean) as string[]
     );
 
-    for (const [url, entry] of preloadCache.current.entries()) {
-      if (!activeUrls.has(url) && entry.status !== 'loading') {
-        preloadCache.current.delete(url);
+    const MAX_CACHE_SIZE = 15;
+    if (preloadCache.current.size > MAX_CACHE_SIZE) {
+      // Get all evictable entries (not currently needed in lookahead window, not currently loading)
+      const evictable = Array.from(preloadCache.current.entries())
+        .filter(([url, entry]) => !activeUrls.has(url) && entry.status !== 'loading')
+        .sort((a, b) => (a[1].lastAccessed || 0) - (b[1].lastAccessed || 0));
+
+      const toEvictCount = preloadCache.current.size - MAX_CACHE_SIZE;
+      for (let i = 0; i < Math.min(toEvictCount, evictable.length); i++) {
+        preloadCache.current.delete(evictable[i][0]);
       }
+    }
+  };
+
+  // High-performance DOM synchronization function to bypass React 60fps renders
+  const syncDOMToTime = (time: number) => {
+    // 1. Update playhead indicator style
+    if (playheadRef.current) {
+      playheadRef.current.style.left = `${(time / project.duration) * 100}%`;
+    }
+
+    // 2. Update digital clock text
+    const formatted = formatTime(time);
+    if (clockRef.current) {
+      clockRef.current.textContent = formatted;
+    }
+
+    // 3. Update Sync Debugger elements (if mounted)
+    if (debugVisualClockRef.current) {
+      debugVisualClockRef.current.textContent = formatted;
+    }
+    const audioTime = (project.audioUrl && audioRef.current) ? audioRef.current.currentTime : time;
+    if (debugClockRef.current) {
+      debugClockRef.current.textContent = formatTime(audioTime);
+    }
+    if (debugDiffRef.current) {
+      const diff = time - audioTime;
+      debugDiffRef.current.textContent = `${diff >= 0 ? '+' : ''}${diff.toFixed(4)}s`;
+      if (Math.abs(diff) > 0.05) {
+        debugDiffRef.current.className = "text-rose-400 font-bold";
+      } else {
+        debugDiffRef.current.className = "text-emerald-400 font-bold";
+      }
+    }
+
+    // 4. Boundary detection for active visual clip
+    const active = findActiveClip(time);
+    const activeId = active ? active.id : null;
+    if (activeId !== activeClipIdRef.current) {
+      activeClipIdRef.current = activeId;
+      setActiveClipState(active);
+      
+      if (debugClipIdxRef.current) {
+        debugClipIdxRef.current.textContent = active ? project.clips.indexOf(active).toString() : 'None';
+      }
+      if (debugClipStartRef.current) {
+        debugClipStartRef.current.textContent = active ? formatTime(active.start) : 'N/A';
+      }
+      if (debugClipEndRef.current) {
+        debugClipEndRef.current.textContent = active ? formatTime(active.end) : 'N/A';
+      }
+    }
+
+    // 5. Boundary detection for active section subtitle
+    const activeSec = project.sections.find(sec => time >= sec.start && time < sec.end);
+    const activeSecId = activeSec ? activeSec.id : null;
+    if (activeSecId !== activeSectionIdRef.current) {
+      activeSectionIdRef.current = activeSecId;
+      setActiveSectionState(activeSec);
+    }
+
+    // 6. Update debug audio state and frame
+    if (debugStateRef.current) {
+      debugStateRef.current.textContent = isPlaying 
+        ? (audioRef.current && (audioRef.current.paused || audioRef.current.readyState < 3) ? 'buffering' : 'playing')
+        : 'paused';
+    }
+    if (debugFrameRef.current) {
+      debugFrameRef.current.textContent = renderFrameRef.current.toString();
     }
   };
 
@@ -237,7 +359,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     // 1. Increment generation ID to cancel older asynchronous loads
     generationRef.current += 1;
 
-    // 2. State update
+    // 2. Set timing references
+    currentTimeRef.current = clampedTime;
     setCurrentTime(clampedTime);
 
     // 3. Audio seek synchronization
@@ -245,16 +368,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       audioRef.current.currentTime = clampedTime;
     }
 
-    // 4. Update the prediction anchor
-    if (isPlaying) {
-      playAnchorRef.current = {
-        audioTime: clampedTime,
-        perfTime: performance.now()
-      };
-      lastAnchorSyncTimeRef.current = performance.now();
-    } else {
-      playAnchorRef.current = null;
-    }
+    // 4. Update playhead line, clocks, active clip & subtitle instantly
+    syncDOMToTime(clampedTime);
 
     // 5. Instantly prepare preloads for the new playhead location (forcing bypass of throttle)
     runPreloadAndDecode(clampedTime, true);
@@ -271,17 +386,11 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         generationRef.current += 1;
         if (project.audioUrl && audioRef.current) {
           const actualTime = audioRef.current.currentTime;
+          currentTimeRef.current = actualTime;
           setCurrentTime(actualTime);
-          if (isPlaying) {
-            playAnchorRef.current = {
-              audioTime: actualTime,
-              perfTime: performance.now()
-            };
-            lastAnchorSyncTimeRef.current = performance.now();
-          }
+          syncDOMToTime(actualTime);
+          runPreloadAndDecode(actualTime, true);
         }
-      } else {
-        playAnchorRef.current = null;
       }
     };
     document.addEventListener('visibilitychange', handleVisibilityChange);
@@ -290,7 +399,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     };
   }, [isPlaying, project.audioUrl]);
 
-  // High-Precision Playback Synchronization Loop with Predictive Timing Anchor (Requirement 2A)
+  // High-Precision Playback Synchronization Loop using Authoritative Clocks
   useEffect(() => {
     if (project.audioUrl && audioRef.current) {
       audioRef.current.playbackRate = playbackSpeed;
@@ -304,78 +413,49 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       }
     }
 
-    if (isPlaying) {
-      const initialAudioTime = (project.audioUrl && audioRef.current) ? audioRef.current.currentTime : currentTime;
-      playAnchorRef.current = {
-        audioTime: initialAudioTime,
-        perfTime: performance.now()
-      };
-      lastAnchorSyncTimeRef.current = performance.now();
-      runPreloadAndDecode(initialAudioTime);
-    } else {
-      playAnchorRef.current = null;
-    }
-
     let rafId: number;
     let lastTime = performance.now();
 
     const tick = () => {
-      if (!isPlaying || document.visibilityState === 'hidden') return;
+      if (!isPlaying) return;
+      
+      // Increment frame count
+      renderFrameRef.current += 1;
       const now = performance.now();
 
       if (project.audioUrl && audioRef.current) {
-        if (playAnchorRef.current && !isSeekingRef.current) {
-          const actualTime = audioRef.current.currentTime;
-          const isAudioStalled = audioRef.current.paused || audioRef.current.readyState < 3;
-          
-          let predictedTime = actualTime;
-          if (isAudioStalled) {
-            // Anchor to actual time if stalled, paused, or buffering
-            playAnchorRef.current = { audioTime: actualTime, perfTime: now };
-            lastAnchorSyncTimeRef.current = now;
-          } else {
-            const elapsed = (now - playAnchorRef.current.perfTime) / 1000;
-            predictedTime = playAnchorRef.current.audioTime + elapsed * playbackSpeed;
-            
-            const diff = Math.abs(predictedTime - actualTime);
-            if (diff > 0.05 || (now - lastAnchorSyncTimeRef.current) > 1000) {
-              playAnchorRef.current = { audioTime: actualTime, perfTime: now };
-              lastAnchorSyncTimeRef.current = now;
-              predictedTime = actualTime;
-            }
-          }
-
-          if (predictedTime >= project.duration) {
-            setIsPlaying(false);
-            setCurrentTime(0);
-            audioRef.current.currentTime = 0;
-            playAnchorRef.current = null;
-          } else {
-            setCurrentTime(predictedTime);
-            runPreloadAndDecode(predictedTime);
-          }
-        }
+        // AUDIO CLOCK AUTHORITY: Direct hardware query
+        const actualTime = audioRef.current.currentTime;
+        currentTimeRef.current = actualTime;
+        
+        syncDOMToTime(actualTime);
+        runPreloadAndDecode(actualTime);
       } else {
+        // FALLBACK CPU TIMING CLOCK: Incremented via high-precision performance.now delta
         const delta = ((now - lastTime) / 1000) * playbackSpeed;
-        lastTime = now;
+        const nextTime = Math.min(project.duration, currentTimeRef.current + delta);
+        currentTimeRef.current = nextTime;
 
-        setCurrentTime((prev) => {
-          const next = prev + delta;
-          if (next >= project.duration) {
-            setIsPlaying(false);
-            return 0;
-          }
-          runPreloadAndDecode(next);
-          return next;
-        });
+        syncDOMToTime(nextTime);
+        runPreloadAndDecode(nextTime);
+
+        if (nextTime >= project.duration) {
+          setIsPlaying(false);
+          handleSeek(0);
+          return;
+        }
       }
 
+      lastTime = now;
       rafId = requestAnimationFrame(tick);
     };
 
     if (isPlaying) {
       lastTime = performance.now();
       rafId = requestAnimationFrame(tick);
+    } else {
+      // Sync React state to the exact paused position
+      setCurrentTime(currentTimeRef.current);
     }
 
     return () => {
@@ -418,20 +498,13 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       .then(() => {
         performSwap();
       })
-      .catch(() => {
-        performSwap();
+      .catch((err) => {
+        console.warn("Direct image decode failed, falling back to load:", err);
+        img.onload = () => {
+          performSwap();
+        };
       });
   }, [activeMedia]);
-
-  // Synchronize audio element settings when they differ
-  useEffect(() => {
-    if (project.audioUrl && audioRef.current && (!isPlaying || isSeekingRef.current)) {
-      const diff = Math.abs(audioRef.current.currentTime - currentTime);
-      if (diff > 0.05) {
-        audioRef.current.currentTime = currentTime;
-      }
-    }
-  }, [currentTime, project.audioUrl, isPlaying]);
 
   // Sync volume / speed on changes
   useEffect(() => {
@@ -1661,13 +1734,84 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
                 </div>
               )}
             </div>
+
+            {/* SYNCHRONIZATION DEBUGGER OVERLAY PANEL */}
+            {showDebugger && (
+              <div className="w-full max-w-2xl mt-4 bg-slate-900/90 border border-slate-800 rounded-xl p-4 font-mono text-[11px] text-slate-300 shadow-xl relative z-20">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2 mb-3">
+                  <div className="flex items-center gap-2">
+                    <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
+                    <span className="font-bold text-slate-200 tracking-wide">AI ALIGNMENT ENGINE SYNCHRONIZATION DEBUGGER</span>
+                  </div>
+                  <button 
+                    onClick={() => setShowDebugger(false)}
+                    className="text-slate-500 hover:text-slate-300 text-xs font-bold"
+                  >
+                    HIDE [X]
+                  </button>
+                </div>
+                
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Audio clock:</div>
+                    <span ref={debugClockRef} className="text-slate-200 font-bold">{formatTime(currentTime)}</span>
+                  </div>
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Visual Playhead:</div>
+                    <span ref={debugVisualClockRef} className="text-slate-200 font-bold">{formatTime(currentTime)}</span>
+                  </div>
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Sync Difference:</div>
+                    <span ref={debugDiffRef} className="text-emerald-400 font-bold">0.0000s</span>
+                  </div>
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Engine State:</div>
+                    <span ref={debugStateRef} className="text-slate-200 font-bold">{isPlaying ? 'playing' : 'paused'}</span>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-3">
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Active Clip Idx:</div>
+                    <span ref={debugClipIdxRef} className="text-slate-200 font-bold">
+                      {activeClip ? project.clips.indexOf(activeClip) : 'None'}
+                    </span>
+                  </div>
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Clip Start Time:</div>
+                    <span ref={debugClipStartRef} className="text-slate-200 font-bold">
+                      {activeClip ? formatTime(activeClip.start) : 'N/A'}
+                    </span>
+                  </div>
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Clip End Time:</div>
+                    <span ref={debugClipEndRef} className="text-slate-200 font-bold">
+                      {activeClip ? formatTime(activeClip.end) : 'N/A'}
+                    </span>
+                  </div>
+                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
+                    <div className="text-slate-500 mb-1">Render Frame:</div>
+                    <span ref={debugFrameRef} className="text-slate-200 font-bold">0</span>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {!showDebugger && (
+              <button
+                onClick={() => setShowDebugger(true)}
+                className="mt-4 px-3 py-1.5 bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-400 hover:text-slate-200 text-[10px] font-mono font-bold rounded-lg tracking-wider"
+              >
+                SHOW ENGINE SYNCHRONIZATION DEBUGGER
+              </button>
+            )}
           </div>
 
           {/* Compact Viewport Video Player Controls Row */}
           <div className="h-16 bg-slate-950/90 border-t border-slate-800/80 px-6 shrink-0 flex items-center justify-between text-slate-300">
             {/* Left: Time tracker */}
             <div className="flex items-center gap-3 font-mono text-xs">
-              <span className="text-slate-100 font-bold">
+              <span className="text-slate-100 font-bold" ref={clockRef}>
                 {Math.floor(currentTime / 60)}:{(Math.floor(currentTime % 60)).toString().padStart(2, '0')}.{Math.floor((currentTime % 1) * 1000).toString().padStart(3, '0')}
               </span>
               <span className="text-slate-600">/</span>
@@ -1917,6 +2061,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
           >
             {/* 3a. Playhead scrubber indicator bar */}
             <div 
+              ref={playheadRef}
               className="absolute top-0 bottom-0 w-px bg-blue-600 z-30 pointer-events-none"
               style={{ left: `${(currentTime / project.duration) * 100}%` }}
             >
