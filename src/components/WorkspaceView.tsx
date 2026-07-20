@@ -40,11 +40,117 @@ import {
 import { Project, MediaItem, TimelineClip, Section, SyncMode, SyncControls, MediaCategory, UnusedReason } from '../types';
 import { getSvgPlaceholder } from '../data/presets';
 
+// STRICT ASSET READINESS BARRIER TYPE DEFINITIONS
+interface PreloadCacheEntry {
+  url: string;
+  img: HTMLImageElement;
+  status: 'unrequested' | 'loading' | 'loaded' | 'decoding' | 'decoded' | 'failed';
+  generation: number;
+  lastAccessed: number;
+  preloadStartedTime?: number;
+  networkCompletedTime?: number;
+  decodingStartedTime?: number;
+  decodingCompletedTime?: number;
+  decodingCompletedAudioTime?: number;
+  targetTimestamp?: number;
+}
+
+interface TransitionAuditHistoryItem {
+  clipIndex: number;
+  url: string;
+  targetTimestamp: number;
+  preloadStarted: number;
+  networkCompleted: number;
+  decodingStarted: number;
+  decodingCompleted: number;
+  readyBeforeDeadline: boolean;
+  actuallyReadyAtTransition: boolean;
+  leadTime: number; // in seconds
+}
+
+interface PreloadAuditStats {
+  totalTransitions: number;
+  readyBeforeDeadline: number;
+  missedDeadlines: number;
+  leadTimes: number[];
+  worstLeadTime: number; // minimum/worst lead time in seconds
+  history: TransitionAuditHistoryItem[];
+}
+
 interface WorkspaceViewProps {
   project: Project;
   onUpdateProject: (updatedProject: Project) => void;
   onBackToDashboard: () => void;
 }
+
+interface TimelineIssue {
+  type: 'overlap' | 'gap' | 'unsorted' | 'invalid_duration';
+  message: string;
+  severity: 'warning' | 'error' | 'info';
+}
+
+const validateTimeline = (clips: TimelineClip[]): TimelineIssue[] => {
+  const issues: TimelineIssue[] = [];
+  if (!clips || clips.length === 0) return issues;
+
+  // Check sorting
+  const sorted = [...clips].sort((a, b) => a.start - b.start);
+  let isSorted = true;
+  for (let i = 0; i < clips.length; i++) {
+    if (clips[i].id !== sorted[i].id) {
+      isSorted = false;
+      break;
+    }
+  }
+  if (!isSorted) {
+    issues.push({
+      type: 'unsorted',
+      message: 'Timeline clips are not chronologically ordered in database store.',
+      severity: 'error'
+    });
+  }
+
+  // Check overlap, gaps, and durations using chronological sorted clips
+  for (let i = 0; i < sorted.length; i++) {
+    const clip = sorted[i];
+    const duration = clip.end - clip.start;
+    
+    if (duration <= 0) {
+      issues.push({
+        type: 'invalid_duration',
+        message: `Clip #${i} has zero or negative duration (${duration.toFixed(3)}s).`,
+        severity: 'error'
+      });
+    } else if (duration < 0.25) {
+      issues.push({
+        type: 'invalid_duration',
+        message: `Clip #${i} is very short (${(duration * 1000).toFixed(0)}ms, under 250ms). This can trigger sub-frame stutter.`,
+        severity: 'warning'
+      });
+    }
+
+    if (i > 0) {
+      const prev = sorted[i - 1];
+      const gap = clip.start - prev.end;
+      
+      if (gap > 0.001) {
+        issues.push({
+          type: 'gap',
+          message: `Gap of ${(gap * 1000).toFixed(0)}ms between Clip #${i-1} (ends at ${prev.end.toFixed(3)}s) and Clip #${i} (starts at ${clip.start.toFixed(3)}s).`,
+          severity: 'warning'
+        });
+      } else if (gap < -0.001) {
+        issues.push({
+          type: 'overlap',
+          message: `Overlap of ${(-gap * 1000).toFixed(0)}ms between Clip #${i-1} and Clip #${i}.`,
+          severity: 'info'
+        });
+      }
+    }
+  }
+
+  return issues;
+};
 
 export default function WorkspaceView({ project, onUpdateProject, onBackToDashboard }: WorkspaceViewProps) {
   // Navigation inside Media Library
@@ -127,18 +233,81 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   const [activeClipState, setActiveClipState] = useState<TimelineClip | null>(null);
   const [activeSectionState, setActiveSectionState] = useState<Section | null>(null);
   const [showDebugger, setShowDebugger] = useState<boolean>(true); // Dev sync debugger overlay
-  const preloadCache = useRef<Map<string, {
-    url: string;
-    img: HTMLImageElement;
-    status: 'loading' | 'decoded' | 'error';
-    generation: number;
-    lastAccessed?: number;
-  }>>(new Map());
 
-  // DOUBLE BUFFERED IMAGE LAYER STATE
+  const preloadCache = useRef<Map<string, PreloadCacheEntry>>(new Map());
+  const visibleClipIdRef = useRef<string | null>(null);
+
+  const [auditStats, setAuditStats] = useState<PreloadAuditStats>({
+    totalTransitions: 0,
+    readyBeforeDeadline: 0,
+    missedDeadlines: 0,
+    leadTimes: [],
+    worstLeadTime: Infinity,
+    history: []
+  });
+
+  // DOUBLE BUFFERED IMAGE LAYER STATE & REFS FOR DIRECT DOM UPDATES
   const [buffer1Url, setBuffer1Url] = useState<string | null>(null);
   const [buffer2Url, setBuffer2Url] = useState<string | null>(null);
   const [activeBuffer, setActiveBuffer] = useState<'1' | '2'>('1');
+
+  const img1Ref = useRef<HTMLImageElement | null>(null);
+  const img2Ref = useRef<HTMLImageElement | null>(null);
+  const activeBufferRef = useRef<'1' | '2'>('1');
+  const buffer1UrlRef = useRef<string | null>(null);
+  const buffer2UrlRef = useRef<string | null>(null);
+
+  // TRANSITION LATENCY MEASUREMENT REFS
+  const lastTransitionMetricsRef = useRef<{
+    clipId: string | null;
+    t1: number; // expected transition audio.currentTime
+    t2: number; // selection timestamp (perf.now)
+    t3: number; // asset readiness timestamp (perf.now)
+    t4: number; // commit swap timestamp (perf.now)
+    t5: number; // visual frame paint timestamp (perf.now)
+    selectionLatency: number;
+    assetLatency: number;
+    commitLatency: number;
+    totalLatency: number;
+  } | null>(null);
+
+  // LATENCY DISPLAY REFS FOR THE DETAILED HUD
+  const debugT1Ref = useRef<HTMLSpanElement | null>(null);
+  const debugT2Ref = useRef<HTMLSpanElement | null>(null);
+  const debugT3Ref = useRef<HTMLSpanElement | null>(null);
+  const debugT4Ref = useRef<HTMLSpanElement | null>(null);
+  const debugT5Ref = useRef<HTMLSpanElement | null>(null);
+  const debugSelLatencyRef = useRef<HTMLSpanElement | null>(null);
+  const debugAssetLatencyRef = useRef<HTMLSpanElement | null>(null);
+  const debugCommitLatencyRef = useRef<HTMLSpanElement | null>(null);
+  const debugTotalLatencyRef = useRef<HTMLSpanElement | null>(null);
+  const debugRatingRef = useRef<HTMLSpanElement | null>(null);
+
+  // CALIBRATABLE VISUAL SYNC OFFSET AND TRANSITION STYLE
+  const [syncOffset, setSyncOffset] = useState<number>(0); // in seconds
+  const syncOffsetRef = useRef<number>(0);
+  const [transitionStyle, setTransitionStyle] = useState<'hard-cut' | 'crossfade'>('hard-cut');
+  const transitionStyleRef = useRef<'hard-cut' | 'crossfade'>('hard-cut');
+
+  const changeTransitionStyle = (style: 'hard-cut' | 'crossfade') => {
+    setTransitionStyle(style);
+    transitionStyleRef.current = style;
+    if (img1Ref.current) img1Ref.current.style.transition = style === 'hard-cut' ? 'none' : 'opacity 150ms ease-in-out';
+    if (img2Ref.current) img2Ref.current.style.transition = style === 'hard-cut' ? 'none' : 'opacity 150ms ease-in-out';
+  };
+
+  const changeSyncOffset = (offset: number) => {
+    setSyncOffset(offset);
+    syncOffsetRef.current = offset;
+  };
+
+  const getSyncCategory = (ms: number) => {
+    const absMs = Math.abs(ms);
+    if (absMs < 5) return { text: 'Excellent (<5ms)', color: 'text-emerald-400 font-extrabold' };
+    if (absMs <= 16) return { text: 'Good (5-16ms)', color: 'text-teal-400 font-bold' };
+    if (absMs <= 50) return { text: 'Noticeable (16-50ms)', color: 'text-amber-400 font-semibold' };
+    return { text: 'Poor (>50ms)', color: 'text-rose-400 font-extrabold animate-pulse' };
+  };
 
   // Binary search implementation for O(log N) frame-accurate clip lookup
   const findActiveClip = (time: number): TimelineClip | null => {
@@ -176,14 +345,37 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
   // Sync state on project load / mount
   useEffect(() => {
+    // Reset preloader cache and audit stats for new project
+    preloadCache.current = new Map();
+    visibleClipIdRef.current = null;
+    setAuditStats({
+      totalTransitions: 0,
+      readyBeforeDeadline: 0,
+      missedDeadlines: 0,
+      leadTimes: [],
+      worstLeadTime: Infinity,
+      history: []
+    });
+
     const initialClip = findActiveClip(currentTime);
     const initialSec = project.sections.find(sec => currentTime >= sec.start && currentTime < sec.end);
     setActiveClipState(initialClip);
     setActiveSectionState(initialSec);
     activeClipIdRef.current = initialClip ? initialClip.id : null;
+    visibleClipIdRef.current = initialClip ? initialClip.id : null;
     activeSectionIdRef.current = initialSec ? initialSec.id : null;
     currentTimeRef.current = currentTime;
     
+    // Initialize double buffer refs and states
+    const initialMedia = initialClip ? project.mediaItems.find(m => m.id === initialClip.mediaId) : null;
+    const initialUrl = initialMedia ? initialMedia.url : null;
+    buffer1UrlRef.current = initialUrl;
+    buffer2UrlRef.current = null;
+    activeBufferRef.current = '1';
+    setBuffer1Url(initialUrl);
+    setBuffer2Url(null);
+    setActiveBuffer('1');
+
     if (playheadRef.current) {
       playheadRef.current.style.left = `${(currentTime / project.duration) * 100}%`;
     }
@@ -197,93 +389,239 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isAiTyping]);
 
-  // Rolling lookahead preloader and decoder cache with memory-safe LRU eviction
+  const recordTransitionAudit = (
+    clip: TimelineClip,
+    url: string,
+    isImmediate: boolean,
+    cachedEntry?: PreloadCacheEntry
+  ) => {
+    const clips = project.clips;
+    const clipIndex = clips.findIndex(c => c.id === clip.id);
+    
+    const preloadStarted = cachedEntry?.preloadStartedTime ?? 0;
+    const networkCompleted = cachedEntry?.networkCompletedTime ?? 0;
+    const decodingStarted = cachedEntry?.decodingStartedTime ?? 0;
+    const decodingCompleted = cachedEntry?.decodingCompletedTime ?? 0;
+    
+    // Calculate lead time: readinessLeadTime = targetTimestamp - decodeCompletionAudioTime
+    const audioTime = cachedEntry?.decodingCompletedAudioTime ?? (audioRef.current ? audioRef.current.currentTime : currentTimeRef.current);
+    const leadTime = clip.start - audioTime;
+    
+    const readyBeforeDeadline = leadTime > 0 && isImmediate;
+    
+    setAuditStats(prev => {
+      // Check if we already have this clip transition recorded in the history
+      const existingIndex = prev.history.findIndex(h => h.targetTimestamp === clip.start);
+      let newHistory = [...prev.history];
+      
+      const historyItem: TransitionAuditHistoryItem = {
+        clipIndex,
+        url,
+        targetTimestamp: clip.start,
+        preloadStarted,
+        networkCompleted,
+        decodingStarted,
+        decodingCompleted,
+        readyBeforeDeadline,
+        actuallyReadyAtTransition: isImmediate,
+        leadTime
+      };
+
+      if (existingIndex >= 0) {
+        newHistory[existingIndex] = historyItem;
+      } else {
+        newHistory.push(historyItem);
+      }
+
+      // Compute aggregates
+      const totalTransitions = newHistory.length;
+      const readyBeforeDeadlineCount = newHistory.filter(h => h.readyBeforeDeadline).length;
+      const missedDeadlinesCount = totalTransitions - readyBeforeDeadlineCount;
+      const validLeadTimes = newHistory.map(h => h.leadTime);
+      const worstLeadTime = validLeadTimes.length > 0 ? Math.min(...validLeadTimes) : 0;
+
+      return {
+        totalTransitions,
+        readyBeforeDeadline: readyBeforeDeadlineCount,
+        missedDeadlines: missedDeadlinesCount,
+        leadTimes: validLeadTimes,
+        worstLeadTime,
+        history: newHistory
+      };
+    });
+  };
+
+  const startAssetPreload = (entry: PreloadCacheEntry, clipIndex: number, targetTimestamp: number) => {
+    const currentGen = generationRef.current;
+    entry.status = 'loading';
+    entry.preloadStartedTime = performance.now();
+    entry.targetTimestamp = targetTimestamp;
+    
+    entry.img.onload = () => {
+      if (entry.generation !== currentGen) return;
+      entry.status = 'loaded';
+      entry.networkCompletedTime = performance.now();
+      
+      // Immediately transition to decoding
+      entry.status = 'decoding';
+      entry.decodingStartedTime = performance.now();
+      
+      entry.img.decode()
+        .then(() => {
+          if (entry.generation !== currentGen) return;
+          entry.status = 'decoded';
+          entry.decodingCompletedTime = performance.now();
+          entry.decodingCompletedAudioTime = audioRef.current ? audioRef.current.currentTime : currentTimeRef.current;
+          entry.lastAccessed = performance.now();
+
+          // If this was the active clip, trigger a late sync swap!
+          const active = findActiveClip(currentTimeRef.current);
+          if (active) {
+            const activeMedia = project.mediaItems.find(m => m.id === active.mediaId);
+            if (activeMedia && activeMedia.url === entry.url) {
+              syncDOMToTime(currentTimeRef.current);
+            }
+          }
+        })
+        .catch((err) => {
+          if (entry.generation !== currentGen) return;
+          console.warn(`Decode failed for ${entry.url}:`, err);
+          entry.status = 'failed';
+        });
+    };
+    
+    entry.img.onerror = () => {
+      if (entry.generation !== currentGen) return;
+      console.warn(`Load failed for ${entry.url}`);
+      entry.status = 'failed';
+    };
+    
+    entry.generation = currentGen;
+    entry.img.src = entry.url;
+  };
+
+  // Rolling lookahead preloader and decoder cache with memory-safe priority-based eviction
   const runPreloadAndDecode = (time: number, force = false) => {
-    // Throttle high-frequency updates during continuous playback (run once every 200ms)
-    if (!force && Math.abs(time - lastPreloadTimeRef.current) < 0.2) {
+    // Throttle high-frequency updates during continuous playback (run once every 100ms for more responsive priority updates)
+    if (!force && Math.abs(time - lastPreloadTimeRef.current) < 0.1) {
       return;
     }
     lastPreloadTimeRef.current = time;
 
-    const lookahead = 3.0; // 3 seconds upcoming window
     const currentGen = generationRef.current;
-
-    // Find all clips in the upcoming timeline window
-    const upcomingClips = project.clips.filter(
-      clip => clip.start >= time && clip.start <= time + lookahead
-    );
-
-    // Ensure the current active clip is also preloaded and decoded
-    const active = findActiveClip(time);
-    const clipsToPreload = active ? [active, ...upcomingClips] : upcomingClips;
-
     const nowTime = performance.now();
-    clipsToPreload.forEach(clip => {
+
+    // 1. Ensure all clips have their media URLs initialized in the preload cache map as 'unrequested' if not present
+    project.clips.forEach(clip => {
       const media = project.mediaItems.find(m => m.id === clip.mediaId);
       if (!media || !media.url) return;
-
       const url = media.url;
-      if (preloadCache.current.has(url)) {
-        const entry = preloadCache.current.get(url)!;
-        entry.lastAccessed = nowTime; // Update LRU access timestamp
-        if (entry.status === 'decoded' || entry.status === 'loading') {
-          return;
-        }
-      }
-
-      // Create preloader image instance
-      const img = new Image();
-      const entry: {
-        url: string;
-        img: HTMLImageElement;
-        status: 'loading' | 'decoded' | 'error';
-        generation: number;
-        lastAccessed: number;
-      } = {
-        url,
-        img,
-        status: 'loading',
-        generation: currentGen,
-        lastAccessed: nowTime
-      };
-      preloadCache.current.set(url, entry);
-
-      img.src = url;
-      img.decode()
-        .then(() => {
-          if (generationRef.current !== currentGen) return;
-          entry.status = 'decoded';
-        })
-        .catch((err) => {
-          if (generationRef.current !== currentGen) return;
-          console.warn(`Failed pre-decoding image ${url}:`, err);
-          entry.status = 'error';
+      if (!preloadCache.current.has(url)) {
+        const img = new Image();
+        preloadCache.current.set(url, {
+          url,
+          img,
+          status: 'unrequested',
+          generation: currentGen,
+          lastAccessed: nowTime,
+          targetTimestamp: clip.start
         });
+      }
     });
 
-    // Memory-Safe LRU Eviction Policy (Max 15 decoded images in memory)
-    const activeUrls = new Set(
-      clipsToPreload.map(clip => {
-        const m = project.mediaItems.find(mi => mi.id === clip.mediaId);
-        return m ? m.url : null;
-      }).filter(Boolean) as string[]
+    // 2. Compute dynamic priorities for each cache entry based on temporal proximity to the playhead
+    const priorities = new Map<string, { score: number; targetClip: TimelineClip; index: number }>();
+    const activeClip = findActiveClip(time);
+
+    // Filter upcoming and compute proximity
+    project.clips.forEach((clip, index) => {
+      const media = project.mediaItems.find(m => m.id === clip.mediaId);
+      if (!media || !media.url) return;
+      const url = media.url;
+
+      // Calculate priority score
+      let score = 0;
+      if (activeClip && activeClip.id === clip.id) {
+        // High priority: the current active clip
+        score = 1000;
+      } else if (clip.start > time) {
+        const timeDiff = clip.start - time;
+        if (timeDiff <= 3.0) {
+          // Priority 2: upcoming clips within lookahead (sorted by proximity)
+          score = 500 - (timeDiff * 50); // scales from 500 down to 350
+        } else if (timeDiff <= 10.0) {
+          score = 200 - (timeDiff * 5); // scales from 150 down to 100
+        } else {
+          // Priority 3: distant upcoming clips
+          score = 50;
+        }
+      } else {
+        // Past clips
+        score = 0;
+      }
+
+      // Keep the highest priority score if multiple clips share the same media URL
+      const existing = priorities.get(url);
+      if (!existing || score > existing.score) {
+        priorities.set(url, { score, targetClip: clip, index });
+      }
+    });
+
+    // 3. Process the queue in order of priority!
+    const cacheEntries = Array.from(preloadCache.current.values()) as PreloadCacheEntry[];
+    
+    // Sort entries by calculated priority score descending
+    cacheEntries.sort((a, b) => {
+      const scoreA = priorities.get(a.url)?.score ?? 0;
+      const scoreB = priorities.get(b.url)?.score ?? 0;
+      return scoreB - scoreA;
+    });
+
+    // Count currently loading or decoding assets
+    const activeLoadCount = cacheEntries.filter(
+      entry => entry.status === 'loading' || entry.status === 'decoding' || entry.status === 'loaded'
+    ).length;
+
+    const maxConcurrentLoads = 2; // Keep queue narrow to prevent network bandwidth throttling!
+
+    // Start preloads for the highest priority entries
+    cacheEntries.forEach(entry => {
+      const prio = priorities.get(entry.url);
+      const score = prio?.score ?? 0;
+
+      // Always force preload the active clip if it is not yet decoded/loading
+      const isCurrentlyActive = activeClip && activeClip.mediaId === project.clips[prio?.index ?? -1]?.mediaId;
+      const shouldPreload = isCurrentlyActive || (activeLoadCount < maxConcurrentLoads && score > 0);
+
+      if (shouldPreload && entry.status === 'unrequested') {
+        startAssetPreload(entry, prio?.index ?? 0, prio?.targetClip.start ?? 0);
+      }
+    });
+
+    // 4. Cache eviction based on memory pressure & temporal distance (Priority 0)
+    // Only evict decoded images that are in the past or extremely distant (Priority 0)
+    const evictable = cacheEntries.filter(
+      entry => entry.status === 'decoded' && (priorities.get(entry.url)?.score ?? 0) === 0
     );
 
-    const MAX_CACHE_SIZE = 15;
-    if (preloadCache.current.size > MAX_CACHE_SIZE) {
-      // Get all evictable entries (not currently needed in lookahead window, not currently loading)
-      const evictable = Array.from(preloadCache.current.entries())
-        .filter(([url, entry]) => !activeUrls.has(url) && entry.status !== 'loading')
-        .sort((a, b) => (a[1].lastAccessed || 0) - (b[1].lastAccessed || 0));
-
-      const toEvictCount = preloadCache.current.size - MAX_CACHE_SIZE;
+    const MAX_DECODED_LIMIT = 8; // Low memory bound to prevent resource pressure
+    const totalDecodedCount = cacheEntries.filter(e => e.status === 'decoded').length;
+    if (totalDecodedCount > MAX_DECODED_LIMIT) {
+      evictable.sort((a, b) => a.lastAccessed - b.lastAccessed);
+      const toEvictCount = totalDecodedCount - MAX_DECODED_LIMIT;
       for (let i = 0; i < Math.min(toEvictCount, evictable.length); i++) {
-        preloadCache.current.delete(evictable[i][0]);
+        const urlToEvict = evictable[i].url;
+        const entry = preloadCache.current.get(urlToEvict);
+        if (entry) {
+          entry.status = 'unrequested';
+          entry.img.src = '';
+          entry.img = new Image();
+        }
       }
     }
   };
 
-  // High-performance DOM synchronization function to bypass React 60fps renders
+  // High-performance DOM synchronization function with strict asset readiness barrier
   const syncDOMToTime = (time: number) => {
     // 1. Update playhead indicator style
     if (playheadRef.current) {
@@ -307,20 +645,139 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     if (debugDiffRef.current) {
       const diff = time - audioTime;
       debugDiffRef.current.textContent = `${diff >= 0 ? '+' : ''}${diff.toFixed(4)}s`;
-      if (Math.abs(diff) > 0.05) {
-        debugDiffRef.current.className = "text-rose-400 font-bold";
-      } else {
-        debugDiffRef.current.className = "text-emerald-400 font-bold";
-      }
+      
+      const diffCategory = getSyncCategory(diff * 1000);
+      debugDiffRef.current.className = `${diffCategory.color} font-bold`;
     }
 
-    // 4. Boundary detection for active visual clip
+    // 4. Boundary detection for active visual clip & Direct-DOM frame swapper
     const active = findActiveClip(time);
     const activeId = active ? active.id : null;
-    if (activeId !== activeClipIdRef.current) {
-      activeClipIdRef.current = activeId;
-      setActiveClipState(active);
+    
+    // Check if the current visible clip ID is different from the active clip ID
+    if (visibleClipIdRef.current !== activeId) {
+      const media = active ? project.mediaItems.find(m => m.id === active.mediaId) : null;
+      const targetUrl = media ? media.url : null;
       
+      if (targetUrl) {
+        const cached = preloadCache.current.get(targetUrl);
+        const isAlreadyDecoded = cached && cached.status === 'decoded';
+        
+        const commitSwap = (t3_perf: number) => {
+          const t1 = active ? active.start : 0;
+          const t2_perf = performance.now(); // Selection time
+          const t4_perf = performance.now(); // Swap committed
+          const nextBuffer = activeBufferRef.current === '1' ? '2' : '1';
+          const isHardCut = transitionStyleRef.current === 'hard-cut';
+          const transitionCSS = isHardCut ? 'none' : 'opacity 150ms ease-in-out';
+          
+          if (nextBuffer === '2') {
+            buffer2UrlRef.current = targetUrl;
+            if (img2Ref.current) {
+              img2Ref.current.src = targetUrl;
+              img2Ref.current.style.transition = transitionCSS;
+              img2Ref.current.style.opacity = '1';
+              img2Ref.current.style.zIndex = '10';
+            }
+            if (img1Ref.current) {
+              img1Ref.current.style.transition = transitionCSS;
+              img1Ref.current.style.opacity = '0';
+              img1Ref.current.style.zIndex = '0';
+            }
+            activeBufferRef.current = '2';
+          } else {
+            buffer1UrlRef.current = targetUrl;
+            if (img1Ref.current) {
+              img1Ref.current.src = targetUrl;
+              img1Ref.current.style.transition = transitionCSS;
+              img1Ref.current.style.opacity = '1';
+              img1Ref.current.style.zIndex = '10';
+            }
+            if (img2Ref.current) {
+              img2Ref.current.style.transition = transitionCSS;
+              img2Ref.current.style.opacity = '0';
+              img2Ref.current.style.zIndex = '0';
+            }
+            activeBufferRef.current = '1';
+          }
+          
+          visibleClipIdRef.current = activeId;
+          activeClipIdRef.current = activeId;
+          
+          // Schedule browser frame paint measurement for T5
+          requestAnimationFrame(() => {
+            const t5_perf = performance.now(); // Frame painted
+            const actualAudioTime = audioRef.current ? audioRef.current.currentTime : time;
+            const perfAtT1 = performance.now() - ((actualAudioTime - t1) * 1000 / playbackSpeed);
+            
+            const selLatency = t2_perf - perfAtT1;
+            const assetLat = t3_perf - perfAtT1;
+            const commLat = t4_perf - perfAtT1;
+            const totLatency = t5_perf - perfAtT1;
+            
+            lastTransitionMetricsRef.current = {
+              clipId: activeId,
+              t1: t1,
+              t2: t2_perf,
+              t3: t3_perf,
+              t4: t4_perf,
+              t5: t5_perf,
+              selectionLatency: Math.max(0, selLatency),
+              assetLatency: Math.max(0, assetLat),
+              commitLatency: Math.max(0, commLat),
+              totalLatency: Math.max(0, totLatency)
+            };
+            
+            updateDebugMetricsDOM();
+          });
+          
+          // Sync state to React asynchronously as background detail
+          setActiveClipState(active);
+          if (nextBuffer === '2') {
+            setBuffer2Url(targetUrl);
+            setActiveBuffer('2');
+          } else {
+            setBuffer1Url(targetUrl);
+            setActiveBuffer('1');
+          }
+        };
+        
+        // STRICT TRANSITION LOGIC BARRIER:
+        if (isAlreadyDecoded) {
+          const t3_perf = performance.now();
+          commitSwap(t3_perf);
+          
+          // Record successful immediate transition audit
+          if (activeClipIdRef.current !== activeId) {
+            activeClipIdRef.current = activeId;
+            recordTransitionAudit(active!, targetUrl, true, cached);
+          }
+        } else {
+          // STRICT BARRIER: Target image is NOT decoded yet!
+          // 1. Keep the current visual frame (do NOT swap image buffers)
+          // 2. Record a missed-readiness event if we just crossed into this new clip
+          if (activeClipIdRef.current !== activeId) {
+            activeClipIdRef.current = activeId;
+            recordTransitionAudit(active!, targetUrl, false, cached);
+            
+            // Force start its preload immediately if it was unrequested
+            if (cached && (cached.status === 'unrequested' || cached.status === 'failed')) {
+              const clipIndex = project.clips.findIndex(c => c.id === activeId);
+              startAssetPreload(cached, clipIndex, active!.start);
+            }
+          }
+        }
+      } else {
+        // No media/clip active: direct-DOM fadeout
+        activeClipIdRef.current = activeId;
+        visibleClipIdRef.current = activeId;
+        setActiveClipState(null);
+        setBuffer1Url(null);
+        setBuffer2Url(null);
+        if (img1Ref.current) img1Ref.current.style.opacity = '0';
+        if (img2Ref.current) img2Ref.current.style.opacity = '0';
+      }
+
       if (debugClipIdxRef.current) {
         debugClipIdxRef.current.textContent = active ? project.clips.indexOf(active).toString() : 'None';
       }
@@ -348,6 +805,28 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     }
     if (debugFrameRef.current) {
       debugFrameRef.current.textContent = renderFrameRef.current.toString();
+    }
+  };
+
+  const updateDebugMetricsDOM = () => {
+    const metrics = lastTransitionMetricsRef.current;
+    if (!metrics) return;
+
+    if (debugT1Ref.current) debugT1Ref.current.textContent = `${metrics.t1.toFixed(3)}s (audio)`;
+    if (debugT2Ref.current) debugT2Ref.current.textContent = `+${(metrics.t2 - metrics.t2).toFixed(1)}ms`; // Selection is reference
+    if (debugT3Ref.current) debugT3Ref.current.textContent = `+${metrics.assetLatency.toFixed(1)}ms`;
+    if (debugT4Ref.current) debugT4Ref.current.textContent = `+${metrics.commitLatency.toFixed(1)}ms`;
+    if (debugT5Ref.current) debugT5Ref.current.textContent = `+${metrics.totalLatency.toFixed(1)}ms`;
+
+    if (debugSelLatencyRef.current) debugSelLatencyRef.current.textContent = `${metrics.selectionLatency.toFixed(1)}ms`;
+    if (debugAssetLatencyRef.current) debugAssetLatencyRef.current.textContent = `${metrics.assetLatency.toFixed(1)}ms`;
+    if (debugCommitLatencyRef.current) debugCommitLatencyRef.current.textContent = `${metrics.commitLatency.toFixed(1)}ms`;
+    if (debugTotalLatencyRef.current) debugTotalLatencyRef.current.textContent = `${metrics.totalLatency.toFixed(1)}ms`;
+
+    if (debugRatingRef.current) {
+      const rating = getSyncCategory(metrics.totalLatency);
+      debugRatingRef.current.textContent = rating.text;
+      debugRatingRef.current.className = rating.color;
     }
   };
 
@@ -465,46 +944,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     };
   }, [isPlaying, playbackSpeed, project.duration, project.audioUrl, isMuted]);
 
-  // Double-Buffered Visual Renderer Layer Swapper with Pre-decoding Guard
-  useEffect(() => {
-    if (!activeMedia) {
-      setBuffer1Url(null);
-      setBuffer2Url(null);
-      return;
-    }
 
-    const targetUrl = activeMedia.url;
-    const currentActiveUrl = activeBuffer === '1' ? buffer1Url : buffer2Url;
-    if (targetUrl === currentActiveUrl) return;
-
-    activeMediaGenRef.current += 1;
-    const currentMediaGen = activeMediaGenRef.current;
-    const currentGen = generationRef.current;
-    const img = new Image();
-    img.src = targetUrl;
-
-    const performSwap = () => {
-      if (generationRef.current !== currentGen || activeMediaGenRef.current !== currentMediaGen) return;
-      if (activeBuffer === '1') {
-        setBuffer2Url(targetUrl);
-        setActiveBuffer('2');
-      } else {
-        setBuffer1Url(targetUrl);
-        setActiveBuffer('1');
-      }
-    };
-
-    img.decode()
-      .then(() => {
-        performSwap();
-      })
-      .catch((err) => {
-        console.warn("Direct image decode failed, falling back to load:", err);
-        img.onload = () => {
-          performSwap();
-        };
-      });
-  }, [activeMedia]);
 
   // Sync volume / speed on changes
   useEffect(() => {
@@ -1673,28 +2113,32 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
             {/* Visual canvas window simulating actual video render */}
             <div id="video_monitor_wrapper" className="w-full max-w-2xl aspect-video bg-black rounded-2xl overflow-hidden relative shadow-2xl border border-slate-800/80 flex flex-col justify-center">
               
-              {activeMedia ? (
+              {project.mediaItems && project.mediaItems.length > 0 ? (
                 <div className="w-full h-full relative overflow-hidden flex items-center justify-center bg-black">
                   
                   {/* Double Buffered Reusable Image Layers */}
-                  {buffer1Url && (
-                    <img
-                      src={buffer1Url}
-                      alt="Active visual frame layer A"
-                      className={`absolute inset-0 w-full h-full object-cover select-none transition-opacity duration-150 ease-in-out ${
-                        activeBuffer === '1' ? 'opacity-100 z-10' : 'opacity-0 z-0'
-                      }`}
-                    />
-                  )}
-                  {buffer2Url && (
-                    <img
-                      src={buffer2Url}
-                      alt="Active visual frame layer B"
-                      className={`absolute inset-0 w-full h-full object-cover select-none transition-opacity duration-150 ease-in-out ${
-                        activeBuffer === '2' ? 'opacity-100 z-10' : 'opacity-0 z-0'
-                      }`}
-                    />
-                  )}
+                  <img
+                    ref={img1Ref}
+                    src={buffer1Url || undefined}
+                    alt="Active visual frame layer A"
+                    className="absolute inset-0 w-full h-full object-cover select-none animate-fade-in"
+                    style={{
+                      opacity: buffer1Url ? (activeBuffer === '1' ? 1 : 0) : 0,
+                      zIndex: activeBuffer === '1' ? 10 : 0,
+                      transition: transitionStyle === 'hard-cut' ? 'none' : 'opacity 150ms ease-in-out'
+                    }}
+                  />
+                  <img
+                    ref={img2Ref}
+                    src={buffer2Url || undefined}
+                    alt="Active visual frame layer B"
+                    className="absolute inset-0 w-full h-full object-cover select-none animate-fade-in"
+                    style={{
+                      opacity: buffer2Url ? (activeBuffer === '2' ? 1 : 0) : 0,
+                      zIndex: activeBuffer === '2' ? 10 : 0,
+                      transition: transitionStyle === 'hard-cut' ? 'none' : 'opacity 150ms ease-in-out'
+                    }}
+                  />
 
                   {/* Cinematic dark vignettes */}
                   <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-transparent to-black/30 pointer-events-none z-10" />
@@ -1737,61 +2181,288 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
             {/* SYNCHRONIZATION DEBUGGER OVERLAY PANEL */}
             {showDebugger && (
-              <div className="w-full max-w-2xl mt-4 bg-slate-900/90 border border-slate-800 rounded-xl p-4 font-mono text-[11px] text-slate-300 shadow-xl relative z-20">
-                <div className="flex items-center justify-between border-b border-slate-800 pb-2 mb-3">
+              <div className="w-full max-w-2xl mt-4 bg-slate-900 border border-slate-800 rounded-xl p-5 font-mono text-[11px] text-slate-300 shadow-xl relative z-20 space-y-4">
+                <div className="flex items-center justify-between border-b border-slate-800 pb-3">
                   <div className="flex items-center gap-2">
-                    <span className="w-2 h-2 rounded-full bg-blue-500 animate-pulse" />
-                    <span className="font-bold text-slate-200 tracking-wide">AI ALIGNMENT ENGINE SYNCHRONIZATION DEBUGGER</span>
+                    <span className="w-2.5 h-2.5 rounded-full bg-blue-500 animate-pulse" />
+                    <span className="font-extrabold text-slate-100 tracking-wide">HIGH-PRECISION ALIGNMENT DEBUGGER & CALIBRATOR</span>
                   </div>
                   <button 
                     onClick={() => setShowDebugger(false)}
-                    className="text-slate-500 hover:text-slate-300 text-xs font-bold"
+                    className="text-slate-500 hover:text-slate-300 text-xs font-bold transition-colors cursor-pointer"
                   >
-                    HIDE [X]
+                    CLOSE [X]
                   </button>
                 </div>
                 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Audio clock:</div>
+                {/* 1. Clocks and Live Sync status */}
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-950/40 p-3 rounded-lg border border-slate-800/40">
+                  <div>
+                    <div className="text-slate-500 mb-0.5">Audio clock:</div>
                     <span ref={debugClockRef} className="text-slate-200 font-bold">{formatTime(currentTime)}</span>
                   </div>
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Visual Playhead:</div>
+                  <div>
+                    <div className="text-slate-500 mb-0.5">Visual Playhead:</div>
                     <span ref={debugVisualClockRef} className="text-slate-200 font-bold">{formatTime(currentTime)}</span>
                   </div>
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Sync Difference:</div>
+                  <div>
+                    <div className="text-slate-500 mb-0.5">Sync Difference:</div>
                     <span ref={debugDiffRef} className="text-emerald-400 font-bold">0.0000s</span>
                   </div>
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Engine State:</div>
+                  <div>
+                    <div className="text-slate-500 mb-0.5">Engine Clock:</div>
                     <span ref={debugStateRef} className="text-slate-200 font-bold">{isPlaying ? 'playing' : 'paused'}</span>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-3">
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Active Clip Idx:</div>
-                    <span ref={debugClipIdxRef} className="text-slate-200 font-bold">
-                      {activeClip ? project.clips.indexOf(activeClip) : 'None'}
+                {/* 2. Transition Pipeline Latency Instrumentation (T1 to T5) */}
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] text-slate-400 font-extrabold tracking-wider uppercase">Transition Pipeline Latency (T1 → T5)</span>
+                    <div className="flex items-center gap-1">
+                      <span className="text-[10px] text-slate-500">Rated Sync Quality:</span>
+                      <span ref={debugRatingRef} className="text-slate-400 font-extrabold font-mono">No transition measured yet</span>
+                    </div>
+                  </div>
+                  
+                  <div className="grid grid-cols-1 md:grid-cols-5 gap-2 text-[10px]">
+                    <div className="bg-slate-950/80 p-2 rounded border border-slate-800 flex flex-col justify-between">
+                      <span className="text-slate-500 font-bold">T1: Audio Target</span>
+                      <span ref={debugT1Ref} className="text-slate-300 font-semibold mt-1">--</span>
+                      <span className="text-[8px] text-slate-600 mt-0.5">Target timestamp reached</span>
+                    </div>
+                    <div className="bg-slate-950/80 p-2 rounded border border-slate-800 flex flex-col justify-between">
+                      <span className="text-slate-500 font-bold">T2: Selected</span>
+                      <span ref={debugT2Ref} className="text-slate-300 font-semibold mt-1">--</span>
+                      <span className="text-[8px] text-slate-600 mt-0.5">Selection latency</span>
+                    </div>
+                    <div className="bg-slate-950/80 p-2 rounded border border-slate-800 flex flex-col justify-between">
+                      <span className="text-slate-500 font-bold">T3: Asset Ready</span>
+                      <span ref={debugT3Ref} className="text-slate-300 font-semibold mt-1">--</span>
+                      <span className="text-[8px] text-slate-600 mt-0.5">Image load/decode duration</span>
+                    </div>
+                    <div className="bg-slate-950/80 p-2 rounded border border-slate-800 flex flex-col justify-between">
+                      <span className="text-slate-500 font-bold">T4: Commited</span>
+                      <span ref={debugT4Ref} className="text-slate-300 font-semibold mt-1">--</span>
+                      <span className="text-[8px] text-slate-600 mt-0.5">Direct-DOM swap delay</span>
+                    </div>
+                    <div className="bg-slate-950/80 p-2 rounded border border-slate-800 flex flex-col justify-between bg-blue-950/10 border-blue-900/30">
+                      <span className="text-blue-400 font-bold">T5: Screen Painted</span>
+                      <span ref={debugT5Ref} className="text-blue-200 font-extrabold mt-1">--</span>
+                      <span className="text-[8px] text-blue-800 mt-0.5">Total visual latency</span>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-slate-400 bg-slate-950/30 p-2.5 rounded border border-slate-800/50 mt-1">
+                    <div>Selection latency: <span ref={debugSelLatencyRef} className="text-slate-200 font-bold">--</span></div>
+                    <div>Asset readiness: <span ref={debugAssetLatencyRef} className="text-slate-200 font-bold">--</span></div>
+                    <div>Commit latency: <span ref={debugCommitLatencyRef} className="text-slate-200 font-bold">--</span></div>
+                    <div className="text-blue-300">Total Visual Transition: <span ref={debugTotalLatencyRef} className="text-blue-100 font-extrabold">--</span></div>
+                  </div>
+                </div>
+
+                {/* 2.5 Strict Asset Readiness Audit Reporting & Metrics */}
+                <div className="border-t border-slate-800/80 pt-3 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] text-slate-400 font-extrabold tracking-wider uppercase">Strict Asset Readiness Audit</span>
+                    <span className="bg-slate-950 px-2 py-0.5 rounded text-[9px] font-bold text-slate-400 border border-slate-800">
+                      Real-Time Tracking
                     </span>
                   </div>
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Clip Start Time:</div>
-                    <span ref={debugClipStartRef} className="text-slate-200 font-bold">
-                      {activeClip ? formatTime(activeClip.start) : 'N/A'}
-                    </span>
+
+                  {/* Summary Metrics Grid */}
+                  <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-center text-[10px]">
+                    <div className="bg-slate-950/60 p-2 rounded border border-slate-800/60">
+                      <div className="text-slate-500 mb-0.5">Total Transitions</div>
+                      <div className="text-slate-200 font-bold text-xs">{auditStats.totalTransitions}</div>
+                    </div>
+                    <div className="bg-slate-950/60 p-2 rounded border border-slate-800/60">
+                      <div className="text-emerald-500/80 mb-0.5">Ready (On-Time)</div>
+                      <div className="text-emerald-400 font-bold text-xs">{auditStats.readyBeforeDeadline}</div>
+                    </div>
+                    <div className="bg-slate-950/60 p-2 rounded border border-slate-800/60">
+                      <div className="text-rose-500/80 mb-0.5">Missed Deadlines</div>
+                      <div className="text-rose-400 font-bold text-xs">{auditStats.missedDeadlines}</div>
+                    </div>
+                    <div className="bg-slate-950/60 p-2 rounded border border-slate-800/60 font-mono">
+                      <div className="text-slate-500 mb-0.5">Avg Lead Time</div>
+                      <div className="text-slate-200 font-bold text-xs">
+                        {auditStats.leadTimes.length > 0 
+                          ? `${(auditStats.leadTimes.reduce((s, x) => s + x, 0) / auditStats.leadTimes.length).toFixed(3)}s` 
+                          : '0.000s'}
+                      </div>
+                    </div>
+                    <div className="bg-slate-950/60 p-2 rounded border border-slate-800/60 font-mono">
+                      <div className="text-slate-500 mb-0.5">Worst Lead Time</div>
+                      <div className={`font-bold text-xs ${
+                        auditStats.worstLeadTime === Infinity ? 'text-slate-200' :
+                        auditStats.worstLeadTime < 0 ? 'text-rose-400' : 'text-emerald-400'
+                      }`}>
+                        {auditStats.worstLeadTime === Infinity ? '0.000s' : `${auditStats.worstLeadTime.toFixed(3)}s`}
+                      </div>
+                    </div>
                   </div>
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Clip End Time:</div>
-                    <span ref={debugClipEndRef} className="text-slate-200 font-bold">
-                      {activeClip ? formatTime(activeClip.end) : 'N/A'}
-                    </span>
+
+                  {/* Transition History Audit Log */}
+                  <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-800/80">
+                    <div className="text-[9px] text-slate-500 font-bold mb-1.5 uppercase flex justify-between">
+                      <span>Audit Trail History Log</span>
+                      <span className="text-slate-600 font-normal">Showing last 4 entries</span>
+                    </div>
+                    <div className="space-y-1.5 max-h-32 overflow-y-auto scrollbar-thin scrollbar-thumb-slate-800 text-[9px] leading-relaxed">
+                      {auditStats.history.length === 0 ? (
+                        <div className="text-slate-600 text-center py-2 italic">
+                          No transitions recorded yet. Play the audio or scrub to record.
+                        </div>
+                      ) : (
+                        [...auditStats.history].reverse().slice(0, 4).map((item, index) => {
+                          const netTime = item.networkCompleted - item.preloadStarted;
+                          const decTime = item.decodingCompleted - item.decodingStarted;
+                          return (
+                            <div key={index} className="flex flex-col sm:flex-row sm:items-center justify-between gap-1 p-1.5 rounded bg-slate-900/40 border border-slate-800/40 hover:bg-slate-900/80 transition-colors">
+                              <div className="flex items-center gap-2">
+                                <span className={`w-1.5 h-1.5 rounded-full ${
+                                  item.readyBeforeDeadline ? 'bg-emerald-400' : 'bg-rose-400 animate-ping'
+                                }`} />
+                                <span className="font-bold text-slate-200">Clip #{item.clipIndex}</span>
+                                <span className="text-slate-500">at {item.targetTimestamp.toFixed(2)}s</span>
+                                <span className={`px-1.5 py-0.2 rounded text-[8px] font-bold ${
+                                  item.readyBeforeDeadline 
+                                    ? 'bg-emerald-950/40 text-emerald-300 border border-emerald-800/20' 
+                                    : 'bg-rose-950/40 text-rose-300 border border-rose-800/20'
+                                }`}>
+                                  {item.readyBeforeDeadline ? 'ON-TIME DECODED' : 'MISSED READINESS BARRIER'}
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-3 text-[8.5px] font-mono text-slate-400">
+                                {item.preloadStarted > 0 && (
+                                  <span>
+                                    Net: <strong className="text-slate-300">{netTime.toFixed(0)}ms</strong> | 
+                                    Dec: <strong className="text-slate-300">{decTime.toFixed(0)}ms</strong>
+                                  </span>
+                                )}
+                                <span className={item.leadTime > 0 ? 'text-emerald-400 font-bold' : 'text-rose-400 font-bold'}>
+                                  Lead: {item.leadTime > 0 ? '+' : ''}{item.leadTime.toFixed(3)}s
+                                </span>
+                              </div>
+                            </div>
+                          );
+                        })
+                      )}
+                    </div>
                   </div>
-                  <div className="bg-slate-950/60 p-2.5 rounded-lg border border-slate-800/40">
-                    <div className="text-slate-500 mb-1">Render Frame:</div>
-                    <span ref={debugFrameRef} className="text-slate-200 font-bold">0</span>
+                </div>
+
+                {/* 3. Calibration controls for Sync Offset and Transition Style */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4 border-t border-slate-800/80 pt-3">
+                  {/* Sync Offset Calibration */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-slate-400 font-extrabold tracking-wider uppercase">Visual Timing Calibration</span>
+                      <span className="text-blue-400 font-bold font-mono text-xs">{(syncOffset * 1000).toFixed(0)} ms</span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <span className="text-slate-500 text-[10px] shrink-0">-500ms (Early)</span>
+                      <input 
+                        type="range"
+                        min="-0.500"
+                        max="0.500"
+                        step="0.010"
+                        value={syncOffset}
+                        onChange={(e) => changeSyncOffset(parseFloat(e.target.value))}
+                        className="flex-1 accent-blue-500 h-1 bg-slate-855 rounded-lg cursor-pointer"
+                      />
+                      <span className="text-slate-500 text-[10px] shrink-0">+500ms (Late)</span>
+                    </div>
+                    <div className="flex items-center justify-between gap-1.5 mt-1">
+                      <button 
+                        onClick={() => changeSyncOffset(Math.max(-0.5, syncOffset - 0.05))}
+                        className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
+                      >
+                        -50ms Nudge
+                      </button>
+                      <button 
+                        onClick={() => changeSyncOffset(Math.max(-0.5, syncOffset - 0.01))}
+                        className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
+                      >
+                        -10ms Nudge
+                      </button>
+                      <button 
+                        onClick={() => changeSyncOffset(0)}
+                        className="px-2 py-1 bg-slate-800 hover:bg-slate-700 hover:text-white rounded transition-colors text-[9px] font-extrabold text-blue-400 cursor-pointer"
+                      >
+                        Reset (0)
+                      </button>
+                      <button 
+                        onClick={() => changeSyncOffset(Math.min(0.5, syncOffset + 0.01))}
+                        className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
+                      >
+                        +10ms Nudge
+                      </button>
+                      <button 
+                        onClick={() => changeSyncOffset(Math.min(0.5, syncOffset + 0.05))}
+                        className="flex-1 bg-slate-800 hover:bg-slate-700 hover:text-white px-1.5 py-1 rounded transition-colors text-[9px] font-bold cursor-pointer"
+                      >
+                        +50ms Nudge
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Transition Style */}
+                  <div className="space-y-2">
+                    <span className="text-[10px] text-slate-400 font-extrabold tracking-wider uppercase block">Visual Transition Animation</span>
+                    <div className="flex bg-slate-950 p-0.5 rounded-lg border border-slate-800/80">
+                      <button
+                        onClick={() => changeTransitionStyle('hard-cut')}
+                        className={`flex-1 py-1.5 rounded-md text-[10px] font-extrabold transition-all cursor-pointer ${
+                          transitionStyle === 'hard-cut' 
+                            ? 'bg-blue-600 text-white shadow'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Instant Hard Cut (0ms)
+                      </button>
+                      <button
+                        onClick={() => changeTransitionStyle('crossfade')}
+                        className={`flex-1 py-1.5 rounded-md text-[10px] font-extrabold transition-all cursor-pointer ${
+                          transitionStyle === 'crossfade' 
+                            ? 'bg-blue-600 text-white shadow'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        Crossfade (150ms)
+                      </button>
+                    </div>
+                    <p className="text-[9px] text-slate-500 leading-normal">
+                      {transitionStyle === 'hard-cut' 
+                        ? '⚡ Hard Cut: Image buffers are swapped frame-accurately with 0ms transition delay.'
+                        : '🌸 Crossfade: Image buffers are faded over 150ms. Perceived delay will be ~75-150ms.'}
+                    </p>
+                  </div>
+                </div>
+
+                {/* 4. Timeline Data Integrity Report */}
+                <div className="border-t border-slate-800/80 pt-3">
+                  <span className="text-[10px] text-slate-400 font-extrabold tracking-wider uppercase block mb-1.5">Timeline Data Integrity Audit</span>
+                  <div className="bg-slate-950 p-3 rounded-lg border border-slate-800 max-h-24 overflow-y-auto space-y-1.5 scrollbar-thin scrollbar-thumb-slate-800">
+                    {validateTimeline(project.clips).length === 0 ? (
+                      <div className="flex items-center gap-1.5 text-emerald-400 text-[10px]">
+                        <Check className="w-3.5 h-3.5 shrink-0" />
+                        <span className="font-bold">Timeline integrity audit passed: 0 defects detected. Clips are sorted, continuous, and duration validated.</span>
+                      </div>
+                    ) : (
+                      validateTimeline(project.clips).map((issue, idx) => (
+                        <div key={idx} className={`flex items-start gap-1.5 text-[9px] leading-relaxed p-1 rounded ${
+                          issue.severity === 'error' ? 'bg-rose-950/20 text-rose-300' :
+                          issue.severity === 'warning' ? 'bg-amber-950/20 text-amber-300' : 'bg-blue-950/20 text-blue-300'
+                        }`}>
+                          {issue.severity === 'error' && <AlertTriangle className="w-3 h-3 shrink-0 text-rose-400 mt-0.5" />}
+                          {issue.severity === 'warning' && <AlertTriangle className="w-3 h-3 shrink-0 text-amber-400 mt-0.5" />}
+                          {issue.severity === 'info' && <Info className="w-3 h-3 shrink-0 text-blue-400 mt-0.5" />}
+                          <span><strong>[{issue.type.toUpperCase()}]</strong> {issue.message}</span>
+                        </div>
+                      ))
+                    )}
                   </div>
                 </div>
               </div>
@@ -1800,7 +2471,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
             {!showDebugger && (
               <button
                 onClick={() => setShowDebugger(true)}
-                className="mt-4 px-3 py-1.5 bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-400 hover:text-slate-200 text-[10px] font-mono font-bold rounded-lg tracking-wider"
+                className="mt-4 px-3 py-1.5 bg-slate-900 border border-slate-800 hover:border-slate-700 text-slate-400 hover:text-slate-200 text-[10px] font-mono font-bold rounded-lg tracking-wider transition-all cursor-pointer"
               >
                 SHOW ENGINE SYNCHRONIZATION DEBUGGER
               </button>
