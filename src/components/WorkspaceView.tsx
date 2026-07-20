@@ -107,6 +107,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   const lastAnchorSyncTimeRef = useRef<number>(0);
   const isSeekingRef = useRef<boolean>(false);
   const generationRef = useRef<number>(1);
+  const lastPreloadTimeRef = useRef<number>(0);
+  const activeMediaGenRef = useRef<number>(0);
   const preloadCache = useRef<Map<string, {
     url: string;
     img: HTMLImageElement;
@@ -153,7 +155,13 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   }, [messages, isAiTyping]);
 
   // Rolling lookahead preloader and decoder cache to avoid white frame flickering
-  const runPreloadAndDecode = (time: number) => {
+  const runPreloadAndDecode = (time: number, force = false) => {
+    // Throttle high-frequency updates during continuous playback (run once every 200ms)
+    if (!force && Math.abs(time - lastPreloadTimeRef.current) < 0.2) {
+      return;
+    }
+    lastPreloadTimeRef.current = time;
+
     const lookahead = 3.0; // 3 seconds upcoming window
     const currentGen = generationRef.current;
 
@@ -248,8 +256,8 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       playAnchorRef.current = null;
     }
 
-    // 5. Instantly prepare preloads for the new playhead location
-    runPreloadAndDecode(clampedTime);
+    // 5. Instantly prepare preloads for the new playhead location (forcing bypass of throttle)
+    runPreloadAndDecode(clampedTime, true);
 
     setTimeout(() => {
       isSeekingRef.current = false;
@@ -317,16 +325,24 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
 
       if (project.audioUrl && audioRef.current) {
         if (playAnchorRef.current && !isSeekingRef.current) {
-          const elapsed = (now - playAnchorRef.current.perfTime) / 1000;
-          let predictedTime = playAnchorRef.current.audioTime + elapsed * playbackSpeed;
-          
           const actualTime = audioRef.current.currentTime;
-          const diff = Math.abs(predictedTime - actualTime);
+          const isAudioStalled = audioRef.current.paused || audioRef.current.readyState < 3;
           
-          if (diff > 0.05 || (now - lastAnchorSyncTimeRef.current) > 1000) {
+          let predictedTime = actualTime;
+          if (isAudioStalled) {
+            // Anchor to actual time if stalled, paused, or buffering
             playAnchorRef.current = { audioTime: actualTime, perfTime: now };
             lastAnchorSyncTimeRef.current = now;
-            predictedTime = actualTime;
+          } else {
+            const elapsed = (now - playAnchorRef.current.perfTime) / 1000;
+            predictedTime = playAnchorRef.current.audioTime + elapsed * playbackSpeed;
+            
+            const diff = Math.abs(predictedTime - actualTime);
+            if (diff > 0.05 || (now - lastAnchorSyncTimeRef.current) > 1000) {
+              playAnchorRef.current = { audioTime: actualTime, perfTime: now };
+              lastAnchorSyncTimeRef.current = now;
+              predictedTime = actualTime;
+            }
           }
 
           if (predictedTime >= project.duration) {
@@ -381,12 +397,14 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     const currentActiveUrl = activeBuffer === '1' ? buffer1Url : buffer2Url;
     if (targetUrl === currentActiveUrl) return;
 
+    activeMediaGenRef.current += 1;
+    const currentMediaGen = activeMediaGenRef.current;
     const currentGen = generationRef.current;
     const img = new Image();
     img.src = targetUrl;
 
     const performSwap = () => {
-      if (generationRef.current !== currentGen) return;
+      if (generationRef.current !== currentGen || activeMediaGenRef.current !== currentMediaGen) return;
       if (activeBuffer === '1') {
         setBuffer2Url(targetUrl);
         setActiveBuffer('2');
