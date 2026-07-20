@@ -73,6 +73,23 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
       if (!projectName) {
         setProjectName(file.name.split('.')[0].replace(/_/g, ' '));
       }
+
+      // Automatically inspect the audio/video file for its exact sub-second duration
+      try {
+        const objectUrl = URL.createObjectURL(file);
+        const audioObj = new Audio(objectUrl);
+        audioObj.addEventListener('loadedmetadata', () => {
+          const fileDuration = audioObj.duration;
+          if (fileDuration && !isNaN(fileDuration)) {
+            setDuration(fileDuration);
+            setDurationMin(Math.floor(fileDuration / 60));
+            setDurationSec(parseFloat((fileDuration % 60).toFixed(4)));
+          }
+          URL.revokeObjectURL(objectUrl);
+        });
+      } catch (err) {
+        console.warn('Failed to extract audio metadata:', err);
+      }
     }
   };
 
@@ -88,6 +105,23 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
       });
       if (!projectName) {
         setProjectName(file.name.split('.')[0].replace(/_/g, ' '));
+      }
+
+      // Automatically inspect the audio/video file for its exact sub-second duration
+      try {
+        const objectUrl = URL.createObjectURL(file);
+        const audioObj = new Audio(objectUrl);
+        audioObj.addEventListener('loadedmetadata', () => {
+          const fileDuration = audioObj.duration;
+          if (fileDuration && !isNaN(fileDuration)) {
+            setDuration(fileDuration);
+            setDurationMin(Math.floor(fileDuration / 60));
+            setDurationSec(parseFloat((fileDuration % 60).toFixed(4)));
+          }
+          URL.revokeObjectURL(objectUrl);
+        });
+      } catch (err) {
+        console.warn('Failed to extract audio metadata:', err);
       }
     }
   };
@@ -287,16 +321,17 @@ export default function NewProjectModal({ isOpen, onClose, onCreateProject }: Ne
                     id="modal_duration_sec_input"
                     type="number"
                     min="0"
-                    max="59"
+                    max="59.9999"
+                    step="any"
                     value={durationSec}
-                    onChange={(e) => updateDuration(durationMin, Number(e.target.value))}
+                    onChange={(e) => updateDuration(durationMin, parseFloat(e.target.value) || 0)}
                     className="w-full text-center text-xs font-bold text-slate-800 focus:outline-none bg-transparent"
                   />
                   <span className="text-[10px] text-slate-400 font-mono uppercase">sec</span>
                 </div>
               </div>
               <p className="text-[10px] text-slate-400 mt-2 font-mono">
-                Total calculated duration: {duration} seconds. (E.g., if your audio is 7:53, set to 7 min and 53 sec).
+                Total calculated duration: {duration.toFixed(4)} seconds. (E.g., if your audio is 7:53.42, set to 7 min and 53.42 sec).
               </p>
             </div>
           </div>

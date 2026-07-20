@@ -112,13 +112,12 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, isAiTyping]);
 
-  // Video Player Playback loop
+  // Video Player Playback loop - High-precision requestAnimationFrame-based synchronization
   useEffect(() => {
-    if (project.audioUrl) {
-      if (!audioRef.current) return;
+    // 1. Sync Audio Element playback state
+    if (project.audioUrl && audioRef.current) {
       audioRef.current.playbackRate = playbackSpeed;
       audioRef.current.muted = isMuted;
-
       if (isPlaying) {
         audioRef.current.play().catch(err => {
           console.warn("Audio playback failed or interrupted:", err);
@@ -126,30 +125,46 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       } else {
         audioRef.current.pause();
       }
-      return;
     }
 
-    // Fallback interval-based timer for projects without real audio files (e.g., presets)
-    if (isPlaying) {
-      const stepMs = 100 / playbackSpeed;
-      playerIntervalRef.current = setInterval(() => {
+    // 2. High-precision RAF loop for both audio tracking and fallback timer tracking
+    let rafId: number;
+    let lastTime = performance.now();
+
+    const tick = () => {
+      if (!isPlaying) return;
+
+      if (project.audioUrl && audioRef.current) {
+        // Read directly from the browser's audio engine with sub-millisecond precision
+        setCurrentTime(audioRef.current.currentTime);
+      } else {
+        // Increment smoothly based on actual high-precision elapsed delta time
+        const now = performance.now();
+        const delta = ((now - lastTime) / 1000) * playbackSpeed;
+        lastTime = now;
+
         setCurrentTime((prev) => {
-          if (prev >= project.duration) {
+          const next = prev + delta;
+          if (next >= project.duration) {
             setIsPlaying(false);
-            if (playerIntervalRef.current) clearInterval(playerIntervalRef.current);
             return 0;
           }
-          return Math.min(prev + 0.1, project.duration);
+          return next;
         });
-      }, 100);
-    } else {
-      if (playerIntervalRef.current) {
-        clearInterval(playerIntervalRef.current);
       }
+
+      rafId = requestAnimationFrame(tick);
+    };
+
+    if (isPlaying) {
+      lastTime = performance.now();
+      rafId = requestAnimationFrame(tick);
     }
 
     return () => {
-      if (playerIntervalRef.current) clearInterval(playerIntervalRef.current);
+      if (rafId) {
+        cancelAnimationFrame(rafId);
+      }
     };
   }, [isPlaying, playbackSpeed, project.duration, project.audioUrl, isMuted]);
 
@@ -157,7 +172,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
   useEffect(() => {
     if (project.audioUrl && audioRef.current) {
       const diff = Math.abs(audioRef.current.currentTime - currentTime);
-      if (diff > 0.3) {
+      if (diff > 0.05) { // Lower threshold to 50ms for instant millisecond-accurate seek snapping!
         audioRef.current.currentTime = currentTime;
       }
     }
@@ -351,8 +366,6 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       const finalClips = Array.from({ length: count }).map((_, idx) => {
         const start = idx * clipDuration;
         const end = Math.min(start + clipDuration, duration);
-        const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
-        const effect = effects[idx % effects.length];
 
         return {
           id: `clip_std_${idx}_${Date.now()}`,
@@ -361,7 +374,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
           end: parseFloat(end.toFixed(4)),
           locked: false,
           confidence: 100,
-          panZoomEffect: effect as any
+          panZoomEffect: 'none' as const
         };
       });
 
@@ -410,8 +423,6 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
       const finalClips = Array.from({ length: count }).map((_, idx) => {
         const start = idx * clipDuration;
         const end = Math.min(start + clipDuration, duration);
-        const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
-        const effect = effects[idx % effects.length];
 
         return {
           id: `clip_std_${idx}_${Date.now()}`,
@@ -420,7 +431,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
           end: parseFloat(end.toFixed(4)),
           locked: false,
           confidence: 100,
-          panZoomEffect: effect as any
+          panZoomEffect: 'none' as const
         };
       });
 
@@ -695,8 +706,6 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         finalClips = Array.from({ length: count }).map((_, idx) => {
           const start = idx * clipDuration;
           const end = Math.min(start + clipDuration, duration);
-          const effects = ['zoom-in', 'pan-left', 'none', 'zoom-out', 'pan-right'];
-          const effect = effects[idx % effects.length];
 
           return {
             id: `clip_std_${idx}_${Date.now()}`,
@@ -705,7 +714,7 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
             end: parseFloat(end.toFixed(4)),     // Millisecond precision!
             locked: false,
             confidence: 100,
-            panZoomEffect: effect as any
+            panZoomEffect: 'none' as const
           };
         });
 
@@ -1364,16 +1373,11 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
               {activeMedia ? (
                 <div className="w-full h-full relative overflow-hidden flex items-center justify-center">
                   
-                  {/* Premium Ken burns kinetic zoom simulator */}
+                  {/* Still high-fidelity image mapping */}
                   <img
                     src={activeMedia.url}
                     alt={activeMedia.name}
-                    className={`w-full h-full object-cover transition-transform duration-[10000ms] ease-out ${
-                      isPlaying && activeClip?.panZoomEffect === 'zoom-in' ? 'scale-115 translate-y-2' :
-                      isPlaying && activeClip?.panZoomEffect === 'zoom-out' ? 'scale-100 translate-y-0 scale-110' :
-                      isPlaying && activeClip?.panZoomEffect === 'pan-left' ? 'scale-110 -translate-x-5' :
-                      isPlaying && activeClip?.panZoomEffect === 'pan-right' ? 'scale-110 translate-x-5' : 'scale-105'
-                    }`}
+                    className="w-full h-full object-contain bg-black select-none"
                   />
 
                   {/* Cinematic dark vignettes */}
@@ -1421,11 +1425,11 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
             {/* Left: Time tracker */}
             <div className="flex items-center gap-3 font-mono text-xs">
               <span className="text-slate-100 font-bold">
-                {Math.floor(currentTime / 60)}:{(Math.floor(currentTime % 60)).toString().padStart(2, '0')}
+                {Math.floor(currentTime / 60)}:{(Math.floor(currentTime % 60)).toString().padStart(2, '0')}.{Math.floor((currentTime % 1) * 1000).toString().padStart(3, '0')}
               </span>
               <span className="text-slate-600">/</span>
               <span className="text-slate-400">
-                {Math.floor(project.duration / 60)}:{(project.duration % 60).toString().padStart(2, '0')}
+                {Math.floor(project.duration / 60)}:{(Math.floor(project.duration % 60)).toString().padStart(2, '0')}.{Math.floor((project.duration % 1) * 1000).toString().padStart(3, '0')}
               </span>
             </div>
 
@@ -1810,7 +1814,12 @@ export default function WorkspaceView({ project, onUpdateProject, onBackToDashbo
         if (!targetClip) return null;
         
         const mediaItem = project.mediaItems.find(m => m.id === targetClip.mediaId);
-        const formatTime = (t: number) => `${Math.floor(t / 60)}:${(Math.floor(t % 60)).toString().padStart(2, '0')}`;
+        const formatTime = (t: number) => {
+          const mins = Math.floor(t / 60);
+          const secs = Math.floor(t % 60);
+          const ms = Math.floor((t % 1) * 1000);
+          return `${mins}:${secs.toString().padStart(2, '0')}.${ms.toString().padStart(3, '0')}`;
+        };
 
         return (
           <div 
